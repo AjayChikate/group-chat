@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Group Chat // WebSocket Lab</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <!-- ============ Username / connect gate ============ -->
+    <div id="gate">
+      <h1>&#9679; group_chat</h1>
+      <p class="sub">
+        real-time multi-room chat over a raw WebSocket connection
+      </p>
+      <form id="joinForm">
+        <div class="row">
+          <label for="username">Username</label>
+          <input
+            type="text"
+            id="username"
+            maxlength="20"
+            placeholder="e.g. sys32"
+            autocomplete="off"
+            required
+          />
+        </div>
+        <div class="row">
+          <label for="roomInput">Starting room (optional)</label>
+          <input
+            type="text"
+            id="roomInput"
+            placeholder="general"
+            autocomplete="off"
+          />
+        </div>
+        <div class="row">
+          <label for="wsUrl">Server address</label>
+          <input
+            type="text"
+            id="wsUrl"
+            placeholder="ws://<server-ip>:8080"
+            autocomplete="off"
+          />
+        </div>
+        <button type="submit">Connect</button>
+        <div class="hintline">
+          Tip: username "admin" (configurable) gets moderator powers.
+        </div>
+        <div class="err" id="joinErr"></div>
+      </form>
+    </div>
+
+    <!-- ============ Main app ============ -->
+    <div id="app">
+      <header>
+        <div class="id">
+          <span class="dot" id="statusDot"></span>
+          <h2>Group Chat</h2>
+          <span class="status" id="statusText">disconnected</span>
+        </div>
+        <div class="me" id="me"></div>
+        <div class="toolbar">
+          <button type="button" id="soundToggleBtn" class="tool-btn" title="Toggle notification sound">
+            🔔
+          </button>
+          <button type="button" id="themeToggleBtn" class="tool-btn" title="Toggle light/dark theme">
+            🌙
+          </button>
+          <button type="button" id="clearChatBtn" class="tool-btn" title="Clear chat view (local only)">
+            🧹
+          </button>
+        </div>
+      </header>
+
+      <aside id="sidebar">
+        <div class="sidebar-section">
+          <div class="sidebar-title">Rooms</div>
+          <div id="roomList"></div>
+        </div>
+        <form id="newRoomForm">
+          <input
+            type="text"
+            id="newRoomInput"
+            maxlength="24"
+            placeholder="+ new room"
+            autocomplete="off"
+          />
+          <button type="submit">Go</button>
+        </form>
+
+        <div class="sidebar-section">
+          <div class="sidebar-title">Online — click to DM</div>
+          <div id="userList"></div>
+        </div>
+      </aside>
+
+      <main id="main">
+        <div id="threadHeader">
+          <span class="thread-title" id="threadTitle">#general</span>
+          <button
+            type="button"
+            class="close-dm"
+            id="closeDmBtn"
+            style="display: none"
+          >
+            &times; back to room
+          </button>
+        </div>
+
+        <div id="log"></div>
+        <div id="typing"></div>
+
+        <form id="composer">
+          <input
+            type="text"
+            id="msgInput"
+            placeholder="Type a message…"
+            autocomplete="off"
+            maxlength="1000"
+          />
+          <button type="submit" id="sendBtn">Send</button>
+        </form>
+        <div id="charCounter" class="char-counter">0 / 1000</div>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
