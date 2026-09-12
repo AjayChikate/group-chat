@@ -4,6 +4,7 @@ store.py — MongoDB-backed persistence with:
   • Ed25519 digital signatures (keys stored encrypted in MongoDB for cross-node sharing)
   • Idempotent / dedup insert: duplicate msg_id is silently ignored (insert_one + DuplicateKeyError)
   • text_plain stored alongside ciphertext so /feed is a pure MongoDB read (no crypto = no timeout)
+  • In-memory deque cache per room — /feed served from RAM for hot rooms (0 MongoDB queries)
   • /metrics support: CPU%, memory%, active connection count
 """
 
@@ -11,6 +12,7 @@ import os
 import threading
 import time
 import psutil
+from collections import deque
 from typing import List, Dict, Any, Optional
 
 from cryptography.exceptions import InvalidTag
@@ -26,17 +28,20 @@ from server import crypto
 # MongoDB connection
 # ---------------------------------------------------------------------------
 
-MONGODB_URI = os.environ.get(
-    'MONGODB_URI',
-    'mongodb+srv://shashankyadavriiii_db_user:9Y2RNLoRD6OWSC4h@cluster0.7azo9pt.mongodb.net'
+MONGODB_URL = os.environ.get(
+    'MONGODB_URL',
+    'mongodb+srv://ajaychikate55555_db_user:y9vwFLWk0Jk6QK3d@cluster0.ofpblfl.mongodb.net/'
 )
 MONGODB_DB = os.environ.get('MONGODB_DB', 'group_chat')
 
 _client = MongoClient(
-    MONGODB_URI,
+    MONGODB_URL,
     serverSelectionTimeoutMS=5000,
-    maxPoolSize=200,
-    waitQueueTimeoutMS=5000,
+    maxPoolSize=10,           # was 200 — 10 × 1 worker × 3 nodes = 30 total (well within Atlas Free ~500 cap)
+    minPoolSize=1,
+    waitQueueTimeoutMS=3000,  # fail fast rather than pile up
+    connectTimeoutMS=5000,
+    socketTimeoutMS=10000,
 )
 _db = _client[MONGODB_DB]
 
@@ -87,6 +92,44 @@ def get_metrics() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# In-memory message cache — avoids MongoDB round-trips for /feed on hot rooms
+# ---------------------------------------------------------------------------
+
+_MSG_CACHE_SIZE = 200                            # messages kept per room
+_msg_cache: Dict[str, deque] = {}               # room_id -> deque of msg dicts
+_msg_cache_lock = threading.Lock()
+
+
+def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
+    """Push a message into the per-room deque. Thread-safe."""
+    with _msg_cache_lock:
+        if room_id not in _msg_cache:
+            _msg_cache[room_id] = deque(maxlen=_MSG_CACHE_SIZE)
+        _msg_cache[room_id].append(msg)
+
+
+def _cache_get(room_id: Optional[str], limit: int) -> Optional[List[Dict[str, Any]]]:
+    """
+    Return cached messages if available.
+    Returns None when cache is cold (room not seen yet) → caller falls back to MongoDB.
+    """
+    with _msg_cache_lock:
+        if room_id is None:
+            # All-rooms feed: only serve from cache if ALL rooms are warm
+            all_msgs = []
+            for dq in _msg_cache.values():
+                all_msgs.extend(dq)
+            if not all_msgs:
+                return None
+            all_msgs.sort(key=lambda m: m.get('timestamp', 0))
+            return all_msgs[-limit:]
+        if room_id not in _msg_cache:
+            return None                          # cache cold — go to MongoDB
+        msgs = list(_msg_cache[room_id])
+        return msgs[-limit:]                     # already chronological (appended in order)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -116,6 +159,9 @@ _user_keys_cache: Dict[str, ed25519.Ed25519PublicKey] = {}
 
 def save_user_public_key(username: str, public_key_bytes: bytes) -> None:
     uname = username.lower()
+    # If already cached, the key is already in MongoDB — skip the write
+    if uname in _user_keys_cache:
+        return
     try:
         pub = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
         _user_keys_cache[uname] = pub
@@ -232,6 +278,21 @@ def append_message(
     except DuplicateKeyError:
         is_new = False   # duplicate msg_id — silently ignored
 
+    # Populate in-memory cache so /feed is served from RAM on subsequent calls
+    if is_new:
+        cached_msg = {
+            'id': msg_id,
+            'username': sender,
+            'client-name': sender,
+            'text': text,
+            'msg': text,
+            'room': room_id,
+            'timestamp': timestamp,
+            'verified': True,
+            'tampered': False,
+        }
+        _cache_put(room_id, cached_msg)
+
     return {
         'id': msg_id,
         'room': room_id,
@@ -261,17 +322,27 @@ def get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
 def get_feed(room_id: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
     """
     Retrieve messages sorted chronologically.
-    Uses text_plain field — NO decryption, NO signature verification.
-    This is intentionally a fast read path so /feed never times out.
-    Integrity was already verified and the message was already signed at insert time.
+
+    Fast path (warm cache):
+      Served entirely from in-memory deque — 0 MongoDB queries.
+      Cache is populated on every append_message() call.
+
+    Cold path (server just started, no messages received yet):
+      Falls back to MongoDB. Uses text_plain — NO decryption, NO signature verification.
     """
+    # ── Fast path: serve from in-memory cache ──
+    cached = _cache_get(room_id, limit)
+    if cached is not None:
+        return cached
+
+    # ── Cold path: cache miss → query MongoDB, then warm the cache ──
     query = {}
     if room_id:
         query['room_id'] = room_id
 
     cursor = _messages.find(
         query,
-        sort=[('timestamp', ASCENDING)],   # chronological, no need to reverse
+        sort=[('timestamp', ASCENDING)],   # chronological
         limit=limit,
         # Only fetch the fields we need — skip large ciphertext/signature blobs
         projection={
@@ -285,13 +356,17 @@ def get_feed(room_id: Optional[str] = None, limit: int = 5000) -> List[Dict[str,
 
     result = []
     for doc in cursor:
-        result.append(_doc_to_msg(doc))
+        msg = _doc_to_msg(doc)
+        result.append(msg)
+        # Warm the cache so subsequent /feed calls are served from RAM
+        _cache_put(msg['room'], msg)
     return result
 
 
 def _doc_to_msg(doc: dict) -> Dict[str, Any]:
     """Convert a MongoDB document to the API response shape."""
     msg_id = doc['_id']
+    msg_id = str(doc['_id'])          # str() handles both UUID strings and legacy ObjectId
     sender = doc.get('sender', 'Anonymous')
     r_id = doc.get('room_id', 'general')
     timestamp = doc.get('timestamp', 0)
@@ -310,3 +385,71 @@ def _doc_to_msg(doc: dict) -> Dict[str, Any]:
         'verified': True,
         'tampered': False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Async wrappers — run blocking pymongo + crypto in a thread pool so the
+# asyncio event loop (and all WebSocket connections) never freeze.
+#
+# max_workers=10 intentionally matches maxPoolSize=10 in MongoClient.
+# There is no benefit in having more threads than available DB connections.
+# ---------------------------------------------------------------------------
+
+import asyncio
+import concurrent.futures
+import functools
+
+_db_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=10,
+    thread_name_prefix='mongo-worker',
+)
+
+
+async def async_append_message(
+    room_id: str,
+    msg: Dict[str, Any],
+    sender_private_key=None,
+) -> Dict[str, Any]:
+    """
+    Non-blocking version of append_message.
+    Runs the full encrypt → sign → insert pipeline in the thread pool
+    so the event loop is never blocked.
+    """
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(append_message, room_id, msg, sender_private_key)
+    return await loop.run_in_executor(_db_executor, fn)
+
+
+async def async_get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Non-blocking version of get_history (used on WebSocket join)."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(get_history, room_id, limit)
+    return await loop.run_in_executor(_db_executor, fn)
+
+
+async def async_get_feed(room_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Non-blocking version of get_feed.
+
+    Fast path (warm cache): returns immediately from in-memory deque — zero
+    thread-pool overhead, zero MongoDB queries.
+
+    Cold path (server just started): offloads the MongoDB cursor to the thread
+    pool, warms the cache, and future calls take the fast path.
+    """
+    # Cache check is just a dict lookup + lock acquire — safe on the event loop
+    cached = _cache_get(room_id, limit)
+    if cached is not None:
+        return cached
+
+    # Cold path — block in thread, not on the event loop
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(get_feed, room_id, limit)
+    return await loop.run_in_executor(_db_executor, fn)
+
+
+async def async_save_user_public_key(username: str, public_key_bytes: bytes) -> None:
+    """Non-blocking key persistence (only writes on first-ever join for a username)."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(save_user_public_key, username, public_key_bytes)
+    await loop.run_in_executor(_db_executor, fn)

@@ -153,7 +153,7 @@ async def post_message(request: Request):
             'timestamp': timestamp,
         }
 
-        saved = store.append_message(room, msg_obj)
+        saved = await store.async_append_message(room, msg_obj)
         room_manager.broadcast(room, {'type': 'message', **msg_obj})
 
         return {
@@ -174,14 +174,16 @@ async def post_message(request: Request):
 
 
 @app.get('/feed')
-async def get_feed_route(room: str = None, limit: int = 10000):
+async def get_feed_route(room: str = None, limit: int = 100):
     """
-    Retrieves all messages.  Fast path — reads text_plain from MongoDB,
-    no decryption or signature verification needed.
+    Retrieves messages.  Fast path — reads from in-memory cache first (0 MongoDB queries
+    for warm rooms).  Falls back to MongoDB on cold start.  Hard-capped at 500 to prevent
+    runaway cursors from saturating the connection pool.
     """
     store.increment_connections()
     try:
-        return store.get_feed(room_id=room, limit=limit)
+        limit = min(limit, 500)          # hard cap — protect the connection pool
+        return await store.async_get_feed(room_id=room, limit=limit)
     finally:
         store.decrement_connections()
 
