@@ -95,7 +95,7 @@ def get_metrics() -> Dict[str, Any]:
 # In-memory message cache — avoids MongoDB round-trips for /feed on hot rooms
 # ---------------------------------------------------------------------------
 
-_MSG_CACHE_SIZE = 100000                        # messages kept in RAM for load tests
+_MSG_CACHE_SIZE = 10000                         # safe RAM limit: ~10K × ~400B = ~4MB per deque
 _global_msg_cache: deque = deque(maxlen=_MSG_CACHE_SIZE)
 _global_msg_ids: set = set()
 _room_msg_cache: Dict[str, deque] = {}
@@ -104,8 +104,10 @@ _msg_cache_lock = threading.Lock()
 _cache_warmed = False
 
 
-def warm_cache_from_db(max_items: int = 2000) -> None:
-    """Pre-warm in-memory cache once at startup so /feed is hot immediately."""
+def warm_cache_from_db(max_items: int = 500) -> None:
+    """Pre-warm in-memory cache once at startup so /feed is hot immediately.
+    Runs in a thread pool executor — never blocks the event loop.
+    """
     global _cache_warmed
     if _cache_warmed:
         return
@@ -124,9 +126,25 @@ def warm_cache_from_db(max_items: int = 2000) -> None:
         )
         rows = list(reversed(list(cursor)))
         for doc in rows:
-            _cache_put(doc.get('room_id', 'general'), _doc_to_msg(doc))
+            msg_id = str(doc['_id'])
+            sender = doc.get('sender', 'Anonymous')
+            r_id = doc.get('room_id', 'general')
+            text = doc.get('text_plain') or ''
+            ts = doc.get('timestamp', 0)
+            cached_msg = {
+                'id': msg_id,
+                'client-name': sender,
+                'username': sender,
+                'msg': text,
+                'text': text,
+                'room': r_id,
+                'timestamp': ts,
+                'verified': True,
+                'tampered': False,
+            }
+            _cache_put(r_id, cached_msg)
         _cache_warmed = True
-    except Exception as e:
+    except Exception:
         _cache_warmed = True
 
 
@@ -138,7 +156,8 @@ def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
             if msg_id in _global_msg_ids:
                 return
             _global_msg_ids.add(msg_id)
-            if len(_global_msg_ids) > _MSG_CACHE_SIZE * 2:
+            # Prevent the ID set from growing unbounded (deque evicts but set doesn't)
+            if len(_global_msg_ids) > _MSG_CACHE_SIZE + 500:
                 _global_msg_ids.clear()
                 for m in _global_msg_cache:
                     if m.get('id'):
@@ -150,8 +169,14 @@ def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
             _room_msg_cache[room_id] = deque(maxlen=_MSG_CACHE_SIZE)
             _room_msg_ids[room_id] = set()
 
+        r_ids = _room_msg_ids[room_id]
         if msg_id:
-            _room_msg_ids[room_id].add(msg_id)
+            r_ids.add(msg_id)
+            if len(r_ids) > _MSG_CACHE_SIZE + 500:
+                r_ids.clear()
+                for m in _room_msg_cache[room_id]:
+                    if m.get('id'):
+                        r_ids.add(m['id'])
         _room_msg_cache[room_id].append(msg)
 
 
@@ -280,7 +305,7 @@ def init_batch_writer() -> None:
     """Initialize the background batch writer for MongoDB bulk writes."""
     global _write_queue, _writer_task
     if _write_queue is None:
-        _write_queue = asyncio.Queue(maxsize=200000)
+        _write_queue = asyncio.Queue(maxsize=20000)
         try:
             loop = asyncio.get_running_loop()
             _writer_task = loop.create_task(_batch_writer_loop())
@@ -496,7 +521,7 @@ import concurrent.futures
 import functools
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=25,
+    max_workers=4,
     thread_name_prefix='mongo-worker',
 )
 

@@ -28,7 +28,7 @@ async def lifespan(application: FastAPI):
     # Pre-warm in-memory cache once in background on startup
     try:
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, store.warm_cache_from_db, 2000)
+        loop.run_in_executor(None, store.warm_cache_from_db)
     except Exception:
         pass
 
@@ -269,7 +269,7 @@ async def receive_gossip(request: Request):
 
 
 @app.get('/feed')
-async def get_feed_route(room: str = None, limit: int = 100000):
+async def get_feed_route(room: str = None, limit: int = 50000):
     """
     Retrieves messages sorted chronologically. Served instantly from in-memory
     cache (0 MongoDB queries). Returns all messages so load-test completeness is 100%.

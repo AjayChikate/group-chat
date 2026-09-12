@@ -24,8 +24,8 @@ def _get_client() -> Optional[Any]:
     global _async_client
     if _async_client is None and _HAS_HTTPX:
         _async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(2.0, connect=0.5),
-            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+            timeout=httpx.Timeout(1.5, connect=0.5),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
     return _async_client
 
@@ -34,7 +34,7 @@ def init_gossip() -> None:
     """Initialize gossip worker for batched peer synchronization."""
     global _gossip_queue, _gossip_worker_task
     if _gossip_queue is None:
-        _gossip_queue = asyncio.Queue(maxsize=50000)
+        _gossip_queue = asyncio.Queue(maxsize=5000)
         try:
             loop = asyncio.get_running_loop()
             _gossip_worker_task = loop.create_task(_gossip_worker_loop())

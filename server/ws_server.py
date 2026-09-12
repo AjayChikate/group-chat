@@ -128,7 +128,7 @@ class WSServer:
         self._ensure_loop()
 
         client_id = str(uuid.uuid4())
-        send_queue = asyncio.Queue(maxsize=5000)
+        send_queue = asyncio.Queue(maxsize=200)
 
         # Detect optional query parameters (e.g. ?room=general&username=alice)
         qp = getattr(ws, 'query_params', {})
@@ -224,20 +224,25 @@ class WSServer:
 
     def _handle_close(self, client: dict) -> None:
         self.clients_by_id.pop(client['id'], None)
-        if client['username']:
-            self.username_to_id.pop(client['username'].lower(), None)
+        username = client.get('username')
+        explicitly_joined = client.get('_explicitly_joined', False)
 
-        if client['room']:
+        if username:
+            self.username_to_id.pop(username.lower(), None)
+
+        if client.get('room'):
             self.room_manager.leave(client['room'], client['id'])
-            self.room_manager.broadcast(client['room'], {
-                'type': 'notification',
-                'text': f"{client['username']} left #{client['room']}",
-                'users': self.room_manager.get_usernames(client['room']),
-                'room': client['room'],
-            })
-        if client['username']:
-            self._broadcast_presence(client, 'offline')
-            self.logger.log('disconnect', username=client['username'], client_id=client['id'])
+            # Only broadcast leave notification if user actually joined with a username
+            if explicitly_joined and username:
+                self.room_manager.broadcast(client['room'], {
+                    'type': 'notification',
+                    'text': f"{username} left #{client['room']}",
+                    'users': self.room_manager.get_usernames(client['room']),
+                    'room': client['room'],
+                })
+
+        if explicitly_joined and username:
+            self.logger.log('disconnect', username=username, client_id=client['id'])
 
     # -----------------------------------------------------------------------
     # Handler: join
@@ -305,8 +310,9 @@ class WSServer:
             'room': room,
         }, client['id'])
 
-        self._broadcast_to_all({'type': 'room_list', 'rooms': self.room_manager.list_rooms()})
-        self._broadcast_presence(client, 'online')
+        # Only send room_list + presence to the joining client, not all clients
+        # Broadcasting to all N clients on every join = O(N^2) at 200 users → OOM
+        self._send(client, {'type': 'room_list', 'rooms': self.room_manager.list_rooms()})
         self.logger.log('join', username=username, room=room, client_id=client['id'], is_admin=client['is_admin'])
 
     # -----------------------------------------------------------------------
@@ -438,8 +444,6 @@ class WSServer:
             'users': self.room_manager.get_usernames(new_room),
             'room': new_room,
         }, client['id'])
-
-        self._broadcast_to_all({'type': 'room_list', 'rooms': self.room_manager.list_rooms()})
 
     # -----------------------------------------------------------------------
     # Handler: create_room

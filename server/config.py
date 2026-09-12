@@ -47,7 +47,7 @@ SERVER_ID = os.environ.get('SERVER_ID', 'backend-unknown')
 PEERS = csv('PEERS', []) or csv('BACKENDS', [])
 
 # Number of uvicorn worker processes
-UVICORN_WORKERS = int(os.environ.get('UVICORN_WORKERS', '4'))
+UVICORN_WORKERS = int(os.environ.get('UVICORN_WORKERS', '1'))
 
 # Rooms that always exist, even with nobody in them.
 DEFAULT_ROOMS = csv('DEFAULT_ROOMS', ['general', 'random', 'tech'])
@@ -73,6 +73,6 @@ RATE_LIMIT = {
     'REFILL_PER_SEC': 999999.0,
 }
 
-MAX_USERNAME_LEN = 2000
-MAX_MESSAGE_LEN = 200000   # increased from 1000
-MAX_ROOM_NAME_LEN = 2400
+MAX_USERNAME_LEN = 100
+MAX_MESSAGE_LEN = 2000     # 2KB max — 200KB × 10K cache = 2GB RAM
+MAX_ROOM_NAME_LEN = 24
