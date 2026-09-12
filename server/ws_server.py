@@ -7,7 +7,7 @@ import uuid
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from server import config, store, crypto
+from server import config, store, crypto, gossip
 from server.rate_limiter import TokenBucket
 
 ROOM_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]{1,24}$')
@@ -272,7 +272,20 @@ class WSServer:
             'timestamp': int(time.time() * 1000),
         }
 
-        # Broadcast to room immediately — no waiting for DB
+        # Cache immediately for /feed
+        store.cache_message(client['room'], {
+            'id': msg['id'],
+            'username': msg['username'],
+            'client-name': msg['username'],
+            'text': msg['text'],
+            'msg': msg['text'],
+            'room': client['room'],
+            'timestamp': msg['timestamp'],
+            'verified': True,
+            'tampered': False,
+        })
+
+        # Broadcast to local room immediately — no waiting for DB
         self.room_manager.broadcast(client['room'], {'type': 'message', **msg})
         self._send(client, {'type': 'delivered', 'id': msg['id']})
 
@@ -281,6 +294,9 @@ class WSServer:
         asyncio.get_event_loop().create_task(
             store.async_append_message(client['room'], msg, client.get('private_key'))
         )
+
+        # Broadcast gossip to peer backends so their WS clients and caches get it
+        gossip.broadcast_gossip(client['room'], msg)
 
     # -----------------------------------------------------------------------
     # Handler: private message

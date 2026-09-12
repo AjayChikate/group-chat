@@ -10,7 +10,7 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from server import config, logger, store
+from server import config, logger, store, gossip
 from server.rooms import RoomManager
 from server.ws_server import WSServer
 
@@ -28,12 +28,13 @@ async def lifespan(application: FastAPI):
         port=config.PORT,
         rooms=config.DEFAULT_ROOMS,
     )
-    print(f'\nGroup Chat [{config.SERVER_ID}] on port {config.PORT}')
+    print(f'\nGroup Chat [{config.SERVER_ID}] on port {config.PORT} | Peers: {config.PEERS}')
 
     yield
 
     logger.log('server_shutdown', server_id=config.SERVER_ID)
     ws_server.shutdown()
+    await gossip.shutdown_gossip()
     await asyncio.sleep(0.3)
 
 
@@ -176,6 +177,11 @@ async def post_message(request: Request):
         # Do NOT await — return 200 to the client immediately.
         asyncio.create_task(store.async_append_message(room, msg_obj))
 
+        # ── Step 4: Gossip to peer backend instances ────────────────────────
+        # Ensures all other backends update their /feed cache and broadcast to
+        # WebSockets connected to them.
+        gossip.broadcast_gossip(room, msg_obj)
+
         return {
             'status': 'ok',
             'id': msg_id,
@@ -191,6 +197,52 @@ async def post_message(request: Request):
         }
     finally:
         store.decrement_connections()
+
+
+# ---------------------------------------------------------------------------
+# Inter-Backend Gossip Endpoint
+# ---------------------------------------------------------------------------
+
+@app.post('/internal/gossip')
+async def receive_gossip(request: Request):
+    """
+    Internal peer gossip endpoint:
+    Receives messages broadcast by other backend nodes.
+    1. Updates local feed cache (so /feed returns it instantly on THIS node)
+    2. Broadcasts to local WebSocket clients connected to THIS node
+    Never re-gossips or re-writes to DB.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'bad json'}, status_code=400)
+
+    origin = data.get('origin')
+    if origin == config.SERVER_ID:
+        return {'status': 'ignored_self'}
+
+    room = data.get('room') or config.DEFAULT_ROOMS[0]
+    msg = data.get('msg')
+    if not msg or not isinstance(msg, dict):
+        return {'status': 'ignored_no_msg'}
+
+    # 1. Update in-memory feed cache on THIS node
+    store.cache_message(room, {
+        'id': msg.get('id'),
+        'username': msg.get('username') or msg.get('client-name', 'Anonymous'),
+        'client-name': msg.get('username') or msg.get('client-name', 'Anonymous'),
+        'text': msg.get('text') or msg.get('msg', ''),
+        'msg': msg.get('text') or msg.get('msg', ''),
+        'room': room,
+        'timestamp': msg.get('timestamp', int(time.time() * 1000)),
+        'verified': True,
+        'tampered': False,
+    })
+
+    # 2. Broadcast to local WebSocket clients connected to THIS node
+    room_manager.broadcast(room, {'type': 'message', **msg})
+
+    return {'status': 'ok'}
 
 
 @app.get('/feed')

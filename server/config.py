@@ -1,5 +1,34 @@
-
 import os
+
+
+def _load_dotenv() -> None:
+    """Load key-value pairs from .env into os.environ if not already present."""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_candidates = [
+        os.path.join(base_dir, '.env'),
+        os.path.abspath('.env'),
+    ]
+    for env_path in env_candidates:
+        if os.path.isfile(env_path):
+            try:
+                with open(env_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#') or '=' not in line:
+                            continue
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        if '#' in v:
+                            v = v.split('#', 1)[0]
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+_load_dotenv()
 
 
 def csv(name: str, fallback: list) -> list:
@@ -13,6 +42,9 @@ PORT = int(os.environ.get('PORT', '5000'))
 
 # Identity of this backend node (backend1 / backend2 / backend3)
 SERVER_ID = os.environ.get('SERVER_ID', 'backend-unknown')
+
+# Peer backend instances for inter-node gossip (reads PEERS or BACKENDS)
+PEERS = csv('PEERS', []) or csv('BACKENDS', [])
 
 # Number of uvicorn worker processes
 UVICORN_WORKERS = int(os.environ.get('UVICORN_WORKERS', '4'))

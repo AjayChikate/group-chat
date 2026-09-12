@@ -95,16 +95,21 @@ def get_metrics() -> Dict[str, Any]:
 # In-memory message cache — avoids MongoDB round-trips for /feed on hot rooms
 # ---------------------------------------------------------------------------
 
-_MSG_CACHE_SIZE = 200                            # messages kept per room
+_MSG_CACHE_SIZE = 2000                           # messages kept per room (supports large load tests in RAM)
 _msg_cache: Dict[str, deque] = {}               # room_id -> deque of msg dicts
 _msg_cache_lock = threading.Lock()
 
 
 def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
-    """Push a message into the per-room deque. Thread-safe."""
+    """Push a message into the per-room deque with dedup. Thread-safe."""
+    msg_id = msg.get('id')
     with _msg_cache_lock:
         if room_id not in _msg_cache:
             _msg_cache[room_id] = deque(maxlen=_MSG_CACHE_SIZE)
+        if msg_id:
+            for existing in _msg_cache[room_id]:
+                if existing.get('id') == msg_id:
+                    return
         _msg_cache[room_id].append(msg)
 
 
