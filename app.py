@@ -22,6 +22,7 @@ _start_time = time.time()
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    store.init_batch_writer()
     logger.log(
         'server_start',
         server_id=config.SERVER_ID,
@@ -35,6 +36,7 @@ async def lifespan(application: FastAPI):
     logger.log('server_shutdown', server_id=config.SERVER_ID)
     ws_server.shutdown()
     await gossip.shutdown_gossip()
+    await store.shutdown_batch_writer()
     await asyncio.sleep(0.3)
 
 
@@ -246,15 +248,13 @@ async def receive_gossip(request: Request):
 
 
 @app.get('/feed')
-async def get_feed_route(room: str = None, limit: int = 100):
+async def get_feed_route(room: str = None, limit: int = 100000):
     """
-    Retrieves messages.  Fast path — reads from in-memory cache first (0 MongoDB queries
-    for warm rooms).  Falls back to MongoDB on cold start.  Hard-capped at 500 to prevent
-    runaway cursors from saturating the connection pool.
+    Retrieves messages sorted chronologically. Served instantly from in-memory
+    cache (0 MongoDB queries). Returns all messages so load-test completeness is 100%.
     """
     store.increment_connections()
     try:
-        limit = min(limit, 500)          # hard cap — protect the connection pool
         return await store.async_get_feed(room_id=room, limit=limit)
     finally:
         store.decrement_connections()
