@@ -1,4 +1,5 @@
 import asyncio
+import json
 import mimetypes
 import time
 import uuid
@@ -23,6 +24,14 @@ _start_time = time.time()
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     store.init_batch_writer()
+    gossip.init_gossip()
+    # Pre-warm in-memory cache once in background on startup
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, store.warm_cache_from_db, 2000)
+    except Exception:
+        pass
+
     logger.log(
         'server_start',
         server_id=config.SERVER_ID,
@@ -210,6 +219,7 @@ async def receive_gossip(request: Request):
     """
     Internal peer gossip endpoint:
     Receives messages broadcast by other backend nodes.
+    Supports both individual payloads and micro-batches.
     1. Updates local feed cache (so /feed returns it instantly on THIS node)
     2. Broadcasts to local WebSocket clients connected to THIS node
     Never re-gossips or re-writes to DB.
@@ -219,30 +229,41 @@ async def receive_gossip(request: Request):
     except Exception:
         return JSONResponse({'error': 'bad json'}, status_code=400)
 
-    origin = data.get('origin')
-    if origin == config.SERVER_ID:
-        return {'status': 'ignored_self'}
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        origin = item.get('origin')
+        if origin == config.SERVER_ID:
+            continue
 
-    room = data.get('room') or config.DEFAULT_ROOMS[0]
-    msg = data.get('msg')
-    if not msg or not isinstance(msg, dict):
-        return {'status': 'ignored_no_msg'}
+        room = item.get('room') or config.DEFAULT_ROOMS[0]
+        msg = item.get('msg')
+        if not msg or not isinstance(msg, dict):
+            continue
 
-    # 1. Update in-memory feed cache on THIS node
-    store.cache_message(room, {
-        'id': msg.get('id'),
-        'username': msg.get('username') or msg.get('client-name', 'Anonymous'),
-        'client-name': msg.get('username') or msg.get('client-name', 'Anonymous'),
-        'text': msg.get('text') or msg.get('msg', ''),
-        'msg': msg.get('text') or msg.get('msg', ''),
-        'room': room,
-        'timestamp': msg.get('timestamp', int(time.time() * 1000)),
-        'verified': True,
-        'tampered': False,
-    })
+        m_id = msg.get('id')
+        user = msg.get('username') or msg.get('client-name', 'Anonymous')
+        text = msg.get('text') or msg.get('msg', '')
+        ts = msg.get('timestamp', int(time.time() * 1000))
 
-    # 2. Broadcast to local WebSocket clients connected to THIS node
-    room_manager.broadcast(room, {'type': 'message', **msg})
+        canonical_msg = {
+            'id': m_id,
+            'client-name': user,
+            'username': user,
+            'msg': text,
+            'text': text,
+            'room': room,
+            'timestamp': ts,
+            'verified': True,
+            'tampered': False,
+        }
+
+        # 1. Update in-memory feed cache on THIS node
+        store.cache_message(room, canonical_msg)
+
+        # 2. Broadcast to local WebSocket clients connected to THIS node
+        room_manager.broadcast(room, {'type': 'message', **canonical_msg})
 
     return {'status': 'ok'}
 
@@ -252,10 +273,12 @@ async def get_feed_route(room: str = None, limit: int = 100000):
     """
     Retrieves messages sorted chronologically. Served instantly from in-memory
     cache (0 MongoDB queries). Returns all messages so load-test completeness is 100%.
+    Fast JSON serialization with Response bypasses FastAPI's slow jsonable_encoder.
     """
     store.increment_connections()
     try:
-        return await store.async_get_feed(room_id=room, limit=limit)
+        msgs = await store.async_get_feed(room_id=room, limit=limit)
+        return Response(content=json.dumps(msgs), media_type='application/json')
     finally:
         store.decrement_connections()
 

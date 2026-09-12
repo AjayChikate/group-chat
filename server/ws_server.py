@@ -45,13 +45,43 @@ class WSServer:
     def _send(self, client: dict, obj: dict) -> None:
         if not client.get('connected', False):
             return
+        payload = json.dumps(obj)
+        q = client.get('send_queue')
+        if q is not None:
+            try:
+                loop = client.get('loop')
+                try:
+                    running_loop = asyncio.get_running_loop()
+                    if running_loop is loop:
+                        q.put_nowait(payload)
+                        return
+                except RuntimeError:
+                    pass
+                if loop and loop.is_running():
+                    loop.call_soon_threadsafe(q.put_nowait, payload)
+            except Exception:
+                pass
+            return
         ws: WebSocket = client['ws']
         loop = self._ensure_loop()
-        payload = json.dumps(obj)
         try:
             asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
         except Exception:
             pass
+
+    async def _client_sender_loop(self, client: dict) -> None:
+        ws: WebSocket = client['ws']
+        q: asyncio.Queue = client['send_queue']
+        while client.get('connected', False):
+            try:
+                payload = await q.get()
+                await ws.send_text(payload)
+                q.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                client['connected'] = False
+                break
 
     def _close_ws(self, client: dict, code: int = 1001) -> None:
         """Schedule an async ws.close() from any thread."""
@@ -98,21 +128,42 @@ class WSServer:
         self._ensure_loop()
 
         client_id = str(uuid.uuid4())
+        send_queue = asyncio.Queue(maxsize=5000)
+
+        # Detect optional query parameters (e.g. ?room=general&username=alice)
+        qp = getattr(ws, 'query_params', {})
+        req_room = qp.get('room') if self._is_valid_room_name(qp.get('room')) else config.DEFAULT_ROOMS[0]
+        req_user = qp.get('username') or qp.get('client-name') or None
+
         client = {
             'id': client_id,
             'ws': ws,
+            'send_queue': send_queue,
             'connected': True,
             'loop': self._loop,
-            'username': None,
-            'room': None,
+            'username': req_user,
+            'room': req_room,
             'is_admin': False,
             'muted': False,
             'presence': 'online',
             'last_activity': time.time(),
             'bucket': TokenBucket(config.RATE_LIMIT['BURST'], config.RATE_LIMIT['REFILL_PER_SEC']),
             'lock': threading.Lock(),
+            '_explicitly_joined': False,
         }
         self.clients_by_id[client_id] = client
+
+        # Auto-join default room so broadcasts reach this socket even before/without 'join' frame
+        self.room_manager.join(req_room, client_id, {
+            'ws': ws,
+            'send_queue': send_queue,
+            'connected': True,
+            'loop': self._loop,
+            'username': req_user or f"User{client_id[:4]}",
+            'lock': client['lock'],
+        })
+
+        sender_task = asyncio.create_task(self._client_sender_loop(client))
 
         try:
             while True:
@@ -142,6 +193,7 @@ class WSServer:
                 await self._dispatch(client, data)
         finally:
             client['connected'] = False
+            sender_task.cancel()
             self._handle_close(client)
 
     # -----------------------------------------------------------------------
@@ -193,7 +245,7 @@ class WSServer:
     # -----------------------------------------------------------------------
 
     async def _handle_join(self, client: dict, data: dict) -> None:
-        if client['username']:
+        if client.get('_explicitly_joined'):
             return  # already joined; ignore repeat joins
 
         requested = str(data.get('username') or '').strip()[:config.MAX_USERNAME_LEN] \
@@ -201,9 +253,15 @@ class WSServer:
         username = self._unique_username(requested)
         room = data.get('room') if self._is_valid_room_name(data.get('room')) else config.DEFAULT_ROOMS[0]
 
+        # Leave previous room if auto-joined to a different one
+        old_room = client.get('room')
+        if old_room and old_room != room:
+            self.room_manager.leave(old_room, client['id'])
+
         client['username'] = username
         client['room'] = room
         client['is_admin'] = username.lower() in config.ADMIN_USERNAMES
+        client['_explicitly_joined'] = True
 
         # Key generation is pure CPU/in-memory (no DB if already cached in crypto module)
         priv_key, pub_key = crypto.get_or_create_sender_keys(username)
@@ -219,13 +277,14 @@ class WSServer:
         self.username_to_id[username.lower()] = client['id']
         self.room_manager.join(room, client['id'], {
             'ws': client['ws'],
+            'send_queue': client.get('send_queue'),
             'connected': True,
             'loop': client['loop'],
             'username': username,
             'lock': client['lock'],
         })
 
-        # Await history — we need it in the welcome payload
+        # Await history — we need it in the welcome payload (served cache-first)
         history = await store.async_get_history(room, config.HISTORY_LIMIT)
 
         self._send(client, {
@@ -260,30 +319,27 @@ class WSServer:
         if not client['username']:
             return
 
-        text = str(data.get('text') or '').strip()[:config.MAX_MESSAGE_LEN]
+        text = str(data.get('text') or data.get('msg') or '').strip()[:config.MAX_MESSAGE_LEN]
         if not text:
             return
 
+        msg_id = str(data.get('id') or uuid.uuid4())
+        timestamp = int(data.get('timestamp') or time.time() * 1000)
+
         msg = {
-            'id': str(uuid.uuid4()),
+            'id': msg_id,
+            'client-name': client['username'],
             'username': client['username'],
+            'msg': text,
             'text': text,
             'room': client['room'],
-            'timestamp': int(time.time() * 1000),
+            'timestamp': timestamp,
+            'verified': True,
+            'tampered': False,
         }
 
         # Cache immediately for /feed
-        store.cache_message(client['room'], {
-            'id': msg['id'],
-            'username': msg['username'],
-            'client-name': msg['username'],
-            'text': msg['text'],
-            'msg': msg['text'],
-            'room': client['room'],
-            'timestamp': msg['timestamp'],
-            'verified': True,
-            'tampered': False,
-        })
+        store.cache_message(client['room'], msg)
 
         # Broadcast to local room immediately — no waiting for DB
         self.room_manager.broadcast(client['room'], {'type': 'message', **msg})
