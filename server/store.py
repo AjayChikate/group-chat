@@ -49,10 +49,10 @@ _messages: Collection = _db['messages']
 _user_keys: Collection = _db['user_keys']
 _user_priv_keys: Collection = _db['user_priv_keys']
 
-# Unique _id on messages is the hard dedup guarantee
+# _id is always unique in MongoDB — no need to create an index for it.
+# Composite index for room history queries + chronological feed index.
 _messages.create_index([('room_id', ASCENDING), ('timestamp', DESCENDING)])
 _messages.create_index([('timestamp', ASCENDING)])   # used by /feed (chronological order)
-_messages.create_index('_id', unique=True)
 _user_keys.create_index('username', unique=True)
 _user_priv_keys.create_index('username', unique=True)
 

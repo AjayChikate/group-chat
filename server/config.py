@@ -9,7 +9,7 @@ def csv(name: str, fallback: list) -> list:
     return [s.strip() for s in raw.split(',') if s.strip()]
 
 
-PORT = int(os.environ.get('PORT', '3000'))
+PORT = int(os.environ.get('PORT', '5000'))
 
 # Identity of this backend node (backend1 / backend2 / backend3)
 SERVER_ID = os.environ.get('SERVER_ID', 'backend-unknown')
