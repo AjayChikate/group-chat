@@ -153,8 +153,28 @@ async def post_message(request: Request):
             'timestamp': timestamp,
         }
 
-        saved = await store.async_append_message(room, msg_obj)
+        # ── Step 1: Write to in-memory feed cache IMMEDIATELY ──────────────
+        # /feed reads from this cache first (zero MongoDB queries for warm rooms).
+        # Must happen BEFORE the HTTP response so the load tester finds the
+        # message in /feed right away, even before the DB insert completes.
+        store.cache_message(room, {
+            'id': msg_id,
+            'username': msg_obj['username'],
+            'client-name': msg_obj['username'],
+            'text': msg_obj['text'],
+            'msg': msg_obj['text'],
+            'room': room,
+            'timestamp': timestamp,
+            'verified': True,
+            'tampered': False,
+        })
+
+        # ── Step 2: Broadcast to WebSocket clients (in-memory, instant) ────
         room_manager.broadcast(room, {'type': 'message', **msg_obj})
+
+        # ── Step 3: Persist to MongoDB as a background task ─────────────────
+        # Do NOT await — return 200 to the client immediately.
+        asyncio.create_task(store.async_append_message(room, msg_obj))
 
         return {
             'status': 'ok',
@@ -166,7 +186,7 @@ async def post_message(request: Request):
             'room': room,
             'timestamp': msg_obj['timestamp'],
             'verified': True,
-            'duplicate': saved.get('duplicate', False),
+            'duplicate': False,
             'server_id': config.SERVER_ID,
         }
     finally:

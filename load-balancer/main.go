@@ -40,12 +40,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -419,23 +421,33 @@ func (lb *LB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&b.activeConns, 1)
 	start := time.Now()
 
-	// Buffer request body for retry resilience (small messages only)
+	// Detect WebSocket upgrade — must NOT buffer the body or wrap the writer
+	// for WS: the Hijacker interface is needed for protocol upgrade.
+	isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+
+	// Buffer request body for retry resilience (small HTTP requests only — NOT WebSocket)
 	var bodyBytes []byte
-	if r.Body != nil && r.ContentLength < 1<<20 { // < 1 MB
+	if !isWS && r.Body != nil && r.ContentLength < 1<<20 { // < 1 MB
 		bodyBytes, _ = io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
-	// Capture response status via wrapper
+	// Capture response status via wrapper.
+	// responseWriter implements http.Hijacker so WebSocket upgrades work.
 	rw := &responseWriter{ResponseWriter: w, statusCode: 200}
 	b.proxy.ServeHTTP(rw, r)
 
-	elapsed := float64(time.Since(start).Milliseconds())
 	atomic.AddInt64(&b.activeConns, -1)
-	b.updateLatency(elapsed, lb.cfg.LBAlpha)
+
+	// Don't skew latency EWMA with WebSocket session durations (minutes/hours)
+	if !isWS {
+		elapsed := float64(time.Since(start).Milliseconds())
+		b.updateLatency(elapsed, lb.cfg.LBAlpha)
+	}
 
 	if rw.statusCode >= 500 {
 		atomic.AddInt64(&lb.totalErrors, 1)
+		elapsed := float64(time.Since(start).Milliseconds())
 		log.Printf("[proxy] %s %s → %s status=%d latency=%.1fms",
 			r.Method, r.URL.Path, b.URL, rw.statusCode, elapsed)
 	}
@@ -548,6 +560,30 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Hijack implements http.Hijacker.
+// Required for WebSocket upgrade: httputil.ReverseProxy calls Hijack() to take
+// over the raw TCP connection for bidirectional proxying. Without this, every
+// WebSocket connection fails with "can't switch protocols using non-Hijacker
+// ResponseWriter type *main.responseWriter".
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf(
+			"responseWriter: underlying %T does not implement http.Hijacker",
+			rw.ResponseWriter,
+		)
+	}
+	return hijacker.Hijack()
+}
+
+// Flush implements http.Flusher.
+// Needed for streaming responses (SSE, chunked transfer).
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -578,10 +614,13 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      lb,
-		ReadTimeout:  cfg.ProxyTimeout,
-		WriteTimeout: cfg.ProxyTimeout,
+		Addr:    cfg.ListenAddr,
+		Handler: lb,
+		// ReadTimeout / WriteTimeout must be 0 (disabled) so long-lived
+		// WebSocket connections are not killed by the server after 30 s.
+		// The WS ping/pong in the Python backend handles keepalives.
+		ReadTimeout:  0,
+		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
 

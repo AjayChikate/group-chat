@@ -37,8 +37,8 @@ MONGODB_DB = os.environ.get('MONGODB_DB', 'group_chat')
 _client = MongoClient(
     MONGODB_URL,
     serverSelectionTimeoutMS=5000,
-    maxPoolSize=10,           # was 200 — 10 × 1 worker × 3 nodes = 30 total (well within Atlas Free ~500 cap)
-    minPoolSize=1,
+    maxPoolSize=25,           # 25 × 3 nodes = 75 total (well within Atlas Free ~500 cap)
+    minPoolSize=2,
     waitQueueTimeoutMS=3000,  # fail fast rather than pile up
     connectTimeoutMS=5000,
     socketTimeoutMS=10000,
@@ -391,8 +391,7 @@ def _doc_to_msg(doc: dict) -> Dict[str, Any]:
 # Async wrappers — run blocking pymongo + crypto in a thread pool so the
 # asyncio event loop (and all WebSocket connections) never freeze.
 #
-# max_workers=10 intentionally matches maxPoolSize=10 in MongoClient.
-# There is no benefit in having more threads than available DB connections.
+# max_workers=25 matches maxPoolSize=25 in MongoClient.
 # ---------------------------------------------------------------------------
 
 import asyncio
@@ -400,9 +399,20 @@ import concurrent.futures
 import functools
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=10,
+    max_workers=25,
     thread_name_prefix='mongo-worker',
 )
+
+
+def cache_message(room_id: str, msg: Dict[str, Any]) -> None:
+    """
+    Immediately write a message into the in-memory feed cache.
+
+    Call this BEFORE the fire-and-forget DB persist so that /feed
+    returns the message instantly — without waiting for MongoDB.
+    This is a pure dict/deque operation (no I/O) and is thread-safe.
+    """
+    _cache_put(room_id, msg)
 
 
 async def async_append_message(
