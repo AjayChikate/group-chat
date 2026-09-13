@@ -24,8 +24,8 @@ def _get_client() -> Optional[Any]:
     global _async_client
     if _async_client is None and _HAS_HTTPX:
         _async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(1.5, connect=0.5),
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            timeout=httpx.Timeout(2.0, connect=0.5),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
         )
     return _async_client
 
@@ -84,7 +84,7 @@ async def _gossip_worker_loop() -> None:
             _gossip_queue.task_done()
 
             start_t = time.time()
-            while len(batch) < 50 and (time.time() - start_t) < 0.02:
+            while len(batch) < 100 and (time.time() - start_t) < 0.03:
                 try:
                     b_item = _gossip_queue.get_nowait()
                     batch.append(b_item)

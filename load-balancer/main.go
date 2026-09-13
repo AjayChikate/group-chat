@@ -120,11 +120,11 @@ func loadConfig() Config {
 	return Config{
 		ListenAddr:      listenAddr,
 		BackendURLs:     strings.Split(backends, ","),
-		HealthInterval:  3 * time.Second,
+		HealthInterval:  5 * time.Second,
 		MetricsInterval: 5 * time.Second,
-		HealthTimeout:   2 * time.Second,
+		HealthTimeout:   5 * time.Second,
 		ProxyTimeout:    30 * time.Second,
-		UnhealthyAfter:  3,
+		UnhealthyAfter:  5,
 		HealthyAfter:    2,
 		Threshold:       threshold,
 		WConn:           wConn,
@@ -281,6 +281,11 @@ func (lb *LB) pick() *Backend {
 		if b.IsHealthy() {
 			healthy = append(healthy, b)
 		}
+	}
+	if len(healthy) == 0 {
+		// Resilience: never return nil if all backends are busy or spiked!
+		// Fallback to all configured backends.
+		healthy = lb.backends
 	}
 	if len(healthy) == 0 {
 		return nil

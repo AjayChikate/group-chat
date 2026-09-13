@@ -565,7 +565,7 @@ import concurrent.futures
 import functools
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=16,
     thread_name_prefix='mongo-worker',
 )
 
@@ -587,11 +587,12 @@ async def async_append_message(
     sender_private_key=None,
 ) -> Dict[str, Any]:
     """
-    Non-blocking version: encrypts, signs, caches in RAM immediately,
-    and enqueues for background batch insertion to MongoDB.
-    Returns in <0.1ms without thread-pool contention.
+    Non-blocking version: runs encryption, signing, and MongoDB queueing
+    in a thread pool so the asyncio event loop NEVER freezes under high RPS.
     """
-    return append_message(room_id, msg, sender_private_key)
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(append_message, room_id, msg, sender_private_key)
+    return await loop.run_in_executor(_db_executor, fn)
 
 
 async def async_get_history(room_id: str, limit: int = 50) -> List[Dict[str, Any]]:
