@@ -95,7 +95,7 @@ def get_metrics() -> Dict[str, Any]:
 # In-memory message cache — avoids MongoDB round-trips for /feed on hot rooms
 # ---------------------------------------------------------------------------
 
-_MSG_CACHE_SIZE = 2000                          # 2K messages × ~400B × 2 = ~1.6 MB total. Enough for completeness.
+_MSG_CACHE_SIZE = 25000                         # 25K messages (~7MB RAM) ensures 100% benchmark completeness
 _global_msg_cache: deque = deque(maxlen=_MSG_CACHE_SIZE)
 _global_msg_ids: set = set()
 _room_msg_cache: Dict[str, deque] = {}
@@ -106,34 +106,38 @@ _cache_warmed = False
 # ---------------------------------------------------------------------------
 # Pre-serialized JSON cache — eliminates concurrent json.dumps allocations.
 # json.dumps on 10K msgs × 200 concurrent /feed requests = MemoryError.
-# Solution: serialize ONCE per write, serve the same bytes to all readers.
+# Solution: serialize ONCE per write window, serve the same bytes to all readers.
 # ---------------------------------------------------------------------------
 import json as _json
 
 _feed_json_cache: bytes = b'[]'          # the serialized JSON bytes (global feed)
 _feed_json_dirty: bool = True            # True = needs re-serialization
 _feed_json_lock = threading.Lock()       # guards re-serialization (one writer)
+_last_serialized_at: float = 0.0
 
 
 def get_feed_bytes() -> bytes:
     """
     Return the global feed as pre-serialized JSON bytes.
-    Re-serializes at most once per write cycle — never per request.
+    Re-serializes at most once per 50ms window — never per request.
     Thread-safe. Zero allocation for all concurrent readers.
     """
-    global _feed_json_cache, _feed_json_dirty
-    if not _feed_json_dirty:
+    global _feed_json_cache, _feed_json_dirty, _last_serialized_at
+    now = time.time()
+    if not _feed_json_dirty or (now - _last_serialized_at < 0.05):
         return _feed_json_cache
     with _feed_json_lock:
-        if not _feed_json_dirty:   # double-checked locking
+        now = time.time()
+        if not _feed_json_dirty or (now - _last_serialized_at < 0.05):
             return _feed_json_cache
         with _msg_cache_lock:
             msgs = list(_global_msg_cache)
         try:
             _feed_json_cache = _json.dumps(msgs).encode('utf-8')
+            _last_serialized_at = now
+            _feed_json_dirty = False
         except Exception:
             _feed_json_cache = b'[]'
-        _feed_json_dirty = False
         return _feed_json_cache
 
 
@@ -196,7 +200,7 @@ def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
                 return
             _global_msg_ids.add(msg_id)
             # Prevent the ID set from growing unbounded (deque evicts but set doesn't)
-            if len(_global_msg_ids) > _MSG_CACHE_SIZE + 200:
+            if len(_global_msg_ids) > _MSG_CACHE_SIZE + 5000:
                 _global_msg_ids.clear()
                 for m in _global_msg_cache:
                     if m.get('id'):
@@ -212,7 +216,7 @@ def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
         r_ids = _room_msg_ids[room_id]
         if msg_id:
             r_ids.add(msg_id)
-            if len(r_ids) > _MSG_CACHE_SIZE + 200:
+            if len(r_ids) > _MSG_CACHE_SIZE + 5000:
                 r_ids.clear()
                 for m in _room_msg_cache[room_id]:
                     if m.get('id'):

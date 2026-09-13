@@ -344,6 +344,6 @@ if __name__ == '__main__':
         # Leave it None (disabled) — memory is bounded by queue sizes, not by 503 rejection.
         limit_concurrency=None,
         limit_max_requests=None,
-        backlog=512,            # OS TCP accept queue — enough for burst of connections
-        timeout_keep_alive=5,   # close idle HTTP keep-alive in 5s to free asyncio state
+        backlog=1024,           # OS TCP accept queue — enough for burst of connections
+        timeout_keep_alive=65,  # keep connections alive for 65s so LB pool never hits closed connections
     )

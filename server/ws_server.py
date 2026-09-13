@@ -130,7 +130,7 @@ class WSServer:
         self._ensure_loop()
 
         client_id = str(uuid.uuid4())
-        send_queue = asyncio.Queue(maxsize=200)
+        send_queue = asyncio.Queue(maxsize=1000)
 
         # Detect optional query parameters (e.g. ?room=general&username=alice)
         qp = getattr(ws, 'query_params', {})

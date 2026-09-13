@@ -53,11 +53,11 @@ import (
 	"net/url"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -155,6 +155,24 @@ type Backend struct {
 	proxy *httputil.ReverseProxy
 }
 
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (bp *bufferPool) Get() []byte {
+	v := bp.pool.Get()
+	if v == nil {
+		return make([]byte, 32*1024)
+	}
+	return v.([]byte)
+}
+
+func (bp *bufferPool) Put(b []byte) {
+	bp.pool.Put(b)
+}
+
+var sharedBufferPool = &bufferPool{}
+
 func newBackend(rawURL string) *Backend {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
@@ -162,18 +180,21 @@ func newBackend(rawURL string) *Backend {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.BufferPool = sharedBufferPool
+
 	// Customise error handler so we get clean error responses
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[proxy] error forwarding to %s: %v", rawURL, err)
 		http.Error(w, `{"error":"backend unavailable"}`, http.StatusBadGateway)
 	}
-	// Low memory transport: don't pool hundreds of idle connections.
-	// 500 idle conns × 32 KB read buffer × 3 backends = ~48 MB just in TCP bufs.
+
+	// High concurrency pooled transport: connections stay alive and are reused across requests
 	proxy.Transport = &http.Transport{
-		MaxIdleConns:        50,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  true, // don't buffer decompressed bodies in LB
+		MaxIdleConns:        10000,
+		MaxIdleConnsPerHost: 2000,
+		IdleConnTimeout:     60 * time.Second,
+		DisableCompression:  true,
+		DisableKeepAlives:   false,
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -438,6 +459,9 @@ func (lb *LB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !isWS && r.Body != nil && r.ContentLength < 1<<20 { // < 1 MB
 		bodyBytes, _ = io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
 	}
 
 	// Capture response status via wrapper.
@@ -597,13 +621,19 @@ func (rw *responseWriter) Flush() {
 // ---------------------------------------------------------------------------
 
 func main() {
-	// Aggressively limit Go runtime memory.
-	// GOGC=20 → GC triggers when heap grows 20% (default=100%) — much more frequent GC.
-	// GOMEMLIMIT=200MiB → hard cap: Go will GC continuously before exceeding this.
-	// Both together mean the LB process stays well under any per-process cgroup limit.
-	debug.SetGCPercent(20)
-	debug.SetMemoryLimit(200 << 20) // 200 MiB hard cap
-	runtime.GOMAXPROCS(2)           // LB is I/O-bound; 2 threads is plenty
+	// Raise OS file descriptor limit so 2000+ concurrent connections succeed
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
+		if rLimit.Cur < 65535 {
+			rLimit.Cur = 65535
+			if rLimit.Max < 65535 {
+				rLimit.Cur = rLimit.Max
+			}
+			_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+		}
+	}
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	cfg := loadConfig()
 

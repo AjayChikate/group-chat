@@ -147,6 +147,8 @@ def get_or_create_sender_keys(username: str) -> Tuple[ed25519.Ed25519PrivateKey,
         pass
 
     pair = (private_key, private_key.public_key())
+    if len(_cached_sender_keys) > 10000:
+        _cached_sender_keys.clear()
     _cached_sender_keys[sanitized] = pair
     return pair
 
