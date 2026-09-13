@@ -52,6 +52,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,11 +167,17 @@ func newBackend(rawURL string) *Backend {
 		log.Printf("[proxy] error forwarding to %s: %v", rawURL, err)
 		http.Error(w, `{"error":"backend unavailable"}`, http.StatusBadGateway)
 	}
-	// Increase transport limits for high concurrency
+	// Low memory transport: don't pool hundreds of idle connections.
+	// 500 idle conns × 32 KB read buffer × 3 backends = ~48 MB just in TCP bufs.
 	proxy.Transport = &http.Transport{
-		MaxIdleConns:        500,
-		MaxIdleConnsPerHost: 200,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true, // don't buffer decompressed bodies in LB
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
 
 	return &Backend{
@@ -589,6 +597,14 @@ func (rw *responseWriter) Flush() {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Aggressively limit Go runtime memory.
+	// GOGC=20 → GC triggers when heap grows 20% (default=100%) — much more frequent GC.
+	// GOMEMLIMIT=200MiB → hard cap: Go will GC continuously before exceeding this.
+	// Both together mean the LB process stays well under any per-process cgroup limit.
+	debug.SetGCPercent(20)
+	debug.SetMemoryLimit(200 << 20) // 200 MiB hard cap
+	runtime.GOMAXPROCS(2)           // LB is I/O-bound; 2 threads is plenty
+
 	cfg := loadConfig()
 
 	log.Printf("=== Group Chat Load Balancer ===")

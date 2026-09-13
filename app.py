@@ -316,6 +316,18 @@ async def static_file(filename: str):
 
 
 if __name__ == '__main__':
+    # Limit Python process memory to 1.5 GB (1.5 × 2^30 bytes).
+    # If cgroup limit is lower than this, cgroup wins — but this prevents
+    # runaway memory growth within the allowed budget.
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = 1536 * 1024 * 1024  # 1.5 GB
+        if hard == resource.RLIM_INFINITY or hard > limit:
+            resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except Exception:
+        pass
+
     uvicorn.run(
         'app:app',
         host='0.0.0.0',
@@ -324,4 +336,8 @@ if __name__ == '__main__':
         ws_ping_interval=config.HEARTBEAT_INTERVAL_MS / 1000,
         ws_ping_timeout=config.HEARTBEAT_INTERVAL_MS / 1000,
         log_level='warning',
+        limit_concurrency=500,   # reject (503) when >500 concurrent requests instead of queueing forever
+        limit_max_requests=None, # no restart after N requests
+        backlog=256,             # OS connection queue — don't accept all 1000 at once
+        timeout_keep_alive=5,    # close idle HTTP keep-alive after 5s (free memory faster)
     )
