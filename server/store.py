@@ -554,7 +554,7 @@ import concurrent.futures
 import functools
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=16,
+    max_workers=4,
     thread_name_prefix='mongo-worker',
 )
 

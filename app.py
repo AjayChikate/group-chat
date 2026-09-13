@@ -2,10 +2,16 @@ import asyncio
 import json
 import json as _json
 import mimetypes
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+try:
+    threading.stack_size(256 * 1024)  # 256 KB thread stack (default is 8 MB on Linux)
+except Exception:
+    pass
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, Request

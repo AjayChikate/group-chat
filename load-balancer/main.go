@@ -2,46 +2,18 @@
 //
 // High-performance Go Load Balancer for Group Chat
 // =================================================
-//
-// Algorithm: Adaptive Weighted Least-Connections (AWLC)
-//
-//   score(b) = w_conn * norm(active_connections)
-//            + w_lat  * norm(latency_ewma_ms)
-//            + w_cpu  * norm(cpu_pct)
-//
-//   Weights (tunable via env):
-//     LB_W_CONN=0.40  LB_W_LAT=0.35  LB_W_CPU=0.25
-//
-//   Routing:
-//     • Always pick backend with lowest score (least loaded).
-//     • If best_score > THRESHOLD (default 0.70) AND another backend is
-//       healthier, switch immediately to that backend.
-//     • If ALL backends are above threshold, still serve on lowest score
-//       (graceful degradation — never return 503 unless all are unhealthy).
-//
-// Health checking:
-//   • Poll GET /health on each backend every 3 s.
-//   • 3 consecutive failures → mark unhealthy, stop routing.
-//   • 2 consecutive successes → mark healthy again.
-//
-// Metric scraping:
-//   • Poll GET /metrics on each backend every 5 s.
-//   • Update CPU%, active_connections used in AWLC score.
-//   • Latency EWMA updated on every proxied request (α = 0.2).
-//
-// Exposed routes:
-//   POST /message  → proxy to best backend
-//   GET  /feed     → proxy to lowest-latency healthy backend
-//   GET  /health   → LB self-health + backend statuses
-//   GET  /metrics  → aggregated backend metrics (for reporting)
-//   *    /ws       → WebSocket proxy to same backend (sticky by conn)
-//
+// Architecture:
+//   1. Clamped TCP Socket Buffers (8KB) — bounds Linux kernel socket memory
+//   2. Concurrency Semaphore (150 in-flight) — user-space queue prevents OOM
+//   3. High-Availability Automatic Retries — 5xx or connection drops retry on peer
+//   4. Lean Connection Pooling — 40 idle conns/host keeps socket overhead <2MB
+//   5. Real-Time Heartbeat Monitor — logs memory, heap, goroutines, backend state
 
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,20 +44,19 @@ type Config struct {
 	MetricsInterval time.Duration
 	HealthTimeout   time.Duration
 	ProxyTimeout    time.Duration
-	UnhealthyAfter  int     // consecutive failures before marking unhealthy
-	HealthyAfter    int     // consecutive successes before marking healthy
-	Threshold       float64 // score above which backend is considered overloaded
-	WConn           float64 // weight: active connections
-	WLat            float64 // weight: latency EWMA
-	WCpu            float64 // weight: CPU percent
-	LBAlpha         float64 // EWMA smoothing factor for latency (0 < α ≤ 1)
+	UnhealthyAfter  int
+	HealthyAfter    int
+	Threshold       float64
+	WConn           float64
+	WLat            float64
+	WCpu            float64
+	LBAlpha         float64
 }
 
 func loadConfig() Config {
 	backends := os.Getenv("BACKENDS")
 	if backends == "" {
-		// Default: three backends on the same machine at different ports (dev mode)
-		backends = "http://BACKEND1_IP:3000,http://BACKEND2_IP:3000,http://BACKEND3_IP:3000"
+		backends = "http://172.17.0.99:5000,http://172.17.0.100:5000,http://172.17.0.101:5000"
 	}
 
 	threshold := 0.70
@@ -135,25 +106,31 @@ func loadConfig() Config {
 }
 
 // ---------------------------------------------------------------------------
-// Backend
+// Clamped TCP Listener (bounds Linux kernel socket buffers to 8KB)
 // ---------------------------------------------------------------------------
 
-type Backend struct {
-	URL string
-
-	mu               sync.RWMutex
-	healthy          bool
-	failStreak       int // consecutive health-check failures
-	successStreak    int // consecutive health-check successes
-	latencyEWMA      float64 // milliseconds, exponential moving average
-	cpuPct           float64
-	memPct           float64
-	activeConns      int64   // tracked locally via atomic counter
-	remoteActiveConn float64 // reported by /metrics
-	lastMetricsAt    time.Time
-
-	proxy *httputil.ReverseProxy
+type clampedListener struct {
+	net.Listener
 }
+
+func (l clampedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(8192)
+		_ = tc.SetWriteBuffer(8192)
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
+	return c, nil
+}
+
+// ---------------------------------------------------------------------------
+// Buffer Pool
+// ---------------------------------------------------------------------------
 
 type bufferPool struct {
 	pool sync.Pool
@@ -179,6 +156,27 @@ func (bp *bufferPool) Put(b []byte) {
 
 var sharedBufferPool = &bufferPool{}
 
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
+
+type Backend struct {
+	URL string
+
+	mu               sync.RWMutex
+	healthy          bool
+	failStreak       int
+	successStreak    int
+	latencyEWMA      float64
+	cpuPct           float64
+	memPct           float64
+	activeConns      int64
+	remoteActiveConn float64
+	lastMetricsAt    time.Time
+
+	proxy *httputil.ReverseProxy
+}
+
 func newBackend(rawURL string) *Backend {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
@@ -188,29 +186,40 @@ func newBackend(rawURL string) *Backend {
 	proxy := httputil.NewSingleHostReverseProxy(u)
 	proxy.BufferPool = sharedBufferPool
 
-	// Customise error handler so we get clean error responses
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[proxy] error forwarding to %s: %v", rawURL, err)
-		http.Error(w, `{"error":"backend unavailable"}`, http.StatusBadGateway)
+		// Do not write headers here; caller's retryResponseWriter captures it
+		w.WriteHeader(http.StatusBadGateway)
 	}
 
-	// Lean pooled transport: 100 idle conns/host is plenty for 2000 users without eating 500MB RAM
+	// Lean connection pool: 40 idle conns per host (120 total) keeps sockets <2MB
 	proxy.Transport = &http.Transport{
-		MaxIdleConns:        300,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:        120,
+		MaxIdleConnsPerHost: 40,
+		IdleConnTimeout:     15 * time.Second,
 		DisableCompression:  true,
 		DisableKeepAlives:   false,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{
+				Timeout:   3 * time.Second,
+				KeepAlive: 15 * time.Second,
+			}
+			c, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetReadBuffer(8192)
+				_ = tc.SetWriteBuffer(8192)
+				_ = tc.SetNoDelay(true)
+			}
+			return c, nil
+		},
 	}
 
 	return &Backend{
 		URL:         rawURL,
-		healthy:     true, // assume healthy until first check fails
-		latencyEWMA: 10,   // seed with 10 ms
+		healthy:     true,
+		latencyEWMA: 10,
 		proxy:       proxy,
 	}
 }
@@ -221,27 +230,23 @@ func (b *Backend) IsHealthy() bool {
 	return b.healthy
 }
 
-// score returns a normalised load score in [0, 1].
-// Lower score = less loaded = preferred.
 func (b *Backend) score(cfg Config, maxConns, maxLat, maxCpu float64) float64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// Use the larger of local atomic counter and reported remote value
 	conns := math.Max(float64(atomic.LoadInt64(&b.activeConns)), b.remoteActiveConn)
+	normConn := normalize(conns, maxConns)
+	normLat := normalize(b.latencyEWMA, maxLat)
+	normCpu := normalize(b.cpuPct, maxCpu)
 
-	normConns := normalize(conns, 0, maxConns)
-	normLat := normalize(b.latencyEWMA, 0, maxLat)
-	normCpu := normalize(b.cpuPct, 0, maxCpu)
-
-	return cfg.WConn*normConns + cfg.WLat*normLat + cfg.WCpu*normCpu
+	return cfg.WConn*normConn + cfg.WLat*normLat + cfg.WCpu*normCpu
 }
 
-func normalize(v, min, max float64) float64 {
-	if max <= min {
+func normalize(val, maxVal float64) float64 {
+	if maxVal <= 0 {
 		return 0
 	}
-	n := (v - min) / (max - min)
+	n := val / maxVal
 	if n < 0 {
 		return 0
 	}
@@ -251,7 +256,6 @@ func normalize(v, min, max float64) float64 {
 	return n
 }
 
-// updateLatency updates the latency EWMA after a proxied request.
 func (b *Backend) updateLatency(ms float64, alpha float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -263,46 +267,56 @@ func (b *Backend) updateLatency(ms float64, alpha float64) {
 // ---------------------------------------------------------------------------
 
 type LB struct {
-	cfg      Config
-	backends []*Backend
-
-	// Stats for /metrics endpoint
-	totalRequests  int64
-	totalErrors    int64
-	startTime      time.Time
+	cfg           Config
+	backends      []*Backend
+	sem           chan struct{} // Concurrency gate: max 150 in-flight requests to backends
+	totalRequests int64
+	totalErrors   int64
+	startTime     time.Time
 }
 
 func newLB(cfg Config) *LB {
-	lb := &LB{cfg: cfg, startTime: time.Now()}
+	lb := &LB{
+		cfg:       cfg,
+		startTime: time.Now(),
+		sem:       make(chan struct{}, 150),
+	}
 	for _, u := range cfg.BackendURLs {
 		lb.backends = append(lb.backends, newBackend(u))
 	}
 	return lb
 }
 
-// pick selects the best backend using AWLC.
 func (lb *LB) pick() *Backend {
-	var healthy []*Backend
+	return lb.pickExcluding(nil)
+}
+
+func (lb *LB) pickExcluding(exclude *Backend) *Backend {
+	var candidates []*Backend
 	for _, b := range lb.backends {
-		if b.IsHealthy() {
-			healthy = append(healthy, b)
+		if b != exclude && b.IsHealthy() {
+			candidates = append(candidates, b)
 		}
 	}
-	if len(healthy) == 0 {
-		// Resilience: never return nil if all backends are busy or spiked!
-		// Fallback to all configured backends.
-		healthy = lb.backends
+	if len(candidates) == 0 {
+		for _, b := range lb.backends {
+			if b != exclude {
+				candidates = append(candidates, b)
+			}
+		}
 	}
-	if len(healthy) == 0 {
+	if len(candidates) == 0 {
+		if len(lb.backends) > 0 {
+			return lb.backends[0]
+		}
 		return nil
 	}
-	if len(healthy) == 1 {
-		return healthy[0]
+	if len(candidates) == 1 {
+		return candidates[0]
 	}
 
-	// Compute per-dimension maxima for normalisation
-	var maxConns, maxLat, maxCpu float64
-	for _, b := range healthy {
+	var maxConns, maxLat, maxCpu float64 = 1, 1, 1
+	for _, b := range candidates {
 		b.mu.RLock()
 		conns := math.Max(float64(atomic.LoadInt64(&b.activeConns)), b.remoteActiveConn)
 		if conns > maxConns {
@@ -316,33 +330,21 @@ func (lb *LB) pick() *Backend {
 		}
 		b.mu.RUnlock()
 	}
-	// Ensure non-zero denominators
-	if maxConns < 1 {
-		maxConns = 1
-	}
-	if maxLat < 1 {
-		maxLat = 1
-	}
-	if maxCpu < 1 {
-		maxCpu = 1
-	}
 
-	best := healthy[0]
+	best := candidates[0]
 	bestScore := best.score(lb.cfg, maxConns, maxLat, maxCpu)
-
-	for _, b := range healthy[1:] {
+	for _, b := range candidates[1:] {
 		s := b.score(lb.cfg, maxConns, maxLat, maxCpu)
 		if s < bestScore {
 			bestScore = s
 			best = b
 		}
 	}
-
 	return best
 }
 
 // ---------------------------------------------------------------------------
-// Health checker
+// Health Checker
 // ---------------------------------------------------------------------------
 
 func (lb *LB) healthLoop() {
@@ -384,12 +386,12 @@ func (lb *LB) checkHealth(client *http.Client, b *Backend) {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics scraper
+// Metrics Scraper
 // ---------------------------------------------------------------------------
 
 type backendMetrics struct {
-	CpuPct           float64 `json:"cpu_pct"`
-	MemPct           float64 `json:"mem_pct"`
+	CpuPct            float64 `json:"cpu_pct"`
+	MemPct            float64 `json:"mem_pct"`
 	ActiveConnections float64 `json:"active_connections"`
 }
 
@@ -431,73 +433,151 @@ func (lb *LB) scrapeMetrics(client *http.Client, b *Backend) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP proxy handler
+// Retry Response Writer (enables transparent HA retries on 5xx)
+// ---------------------------------------------------------------------------
+
+type retryResponseWriter struct {
+	target      http.ResponseWriter
+	header      http.Header
+	buf         bytes.Buffer
+	statusCode  int
+	wroteHeader bool
+}
+
+func (rw *retryResponseWriter) Header() http.Header {
+	if rw.header == nil {
+		rw.header = make(http.Header)
+	}
+	return rw.header
+}
+
+func (rw *retryResponseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.wroteHeader = true
+}
+
+func (rw *retryResponseWriter) Write(b []byte) (int, error) {
+	if !rw.wroteHeader {
+		rw.statusCode = http.StatusOK
+		rw.wroteHeader = true
+	}
+	return rw.buf.Write(b)
+}
+
+func (rw *retryResponseWriter) FlushToTarget() {
+	for k, vv := range rw.header {
+		for _, v := range vv {
+			rw.target.Header().Add(k, v)
+		}
+	}
+	code := rw.statusCode
+	if code == 0 {
+		code = http.StatusOK
+	}
+	rw.target.WriteHeader(code)
+	if rw.buf.Len() > 0 {
+		_, _ = rw.target.Write(rw.buf.Bytes())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTP Proxy Handler
 // ---------------------------------------------------------------------------
 
 func (lb *LB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&lb.totalRequests, 1)
 
-	// Self-health endpoint
+	// Built-in health & metrics endpoints
 	if r.URL.Path == "/health" && r.Method == http.MethodGet {
 		lb.serveHealth(w, r)
 		return
 	}
-	// Aggregated metrics endpoint
 	if r.URL.Path == "/metrics" && r.Method == http.MethodGet {
 		lb.serveMetrics(w, r)
 		return
 	}
 
-	b := lb.pick()
-	if b == nil {
-		atomic.AddInt64(&lb.totalErrors, 1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":"all backends unavailable"}`))
+	isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+
+	// 1. WebSocket Proxying (bypass queue & buffer for raw streaming)
+	if isWS {
+		b := lb.pick()
+		if b == nil {
+			atomic.AddInt64(&lb.totalErrors, 1)
+			http.Error(w, `{"error":"no backends available"}`, http.StatusServiceUnavailable)
+			return
+		}
+		atomic.AddInt64(&b.activeConns, 1)
+		b.proxy.ServeHTTP(w, r)
+		atomic.AddInt64(&b.activeConns, -1)
 		return
 	}
 
-	// Track active connections (atomic)
-	atomic.AddInt64(&b.activeConns, 1)
-	start := time.Now()
-
-	// Detect WebSocket upgrade — must NOT buffer the body or wrap the writer
-	// for WS: the Hijacker interface is needed for protocol upgrade.
-	isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
-
-	// Buffer request body for retry resilience (only POST/PUT with a body, never GET/WS)
-	var bodyBytes []byte
-	if !isWS && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && r.ContentLength > 0 && r.ContentLength < 1<<20 {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		r.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-		}
-	}
-
-	// Capture response status via wrapper.
-	// responseWriter implements http.Hijacker so WebSocket upgrades work.
-	rw := &responseWriter{ResponseWriter: w, statusCode: 200}
-	b.proxy.ServeHTTP(rw, r)
-
-	atomic.AddInt64(&b.activeConns, -1)
-
-	// Don't skew latency EWMA with WebSocket session durations (minutes/hours)
-	if !isWS {
-		elapsed := float64(time.Since(start).Milliseconds())
-		b.updateLatency(elapsed, lb.cfg.LBAlpha)
-	}
-
-	if rw.statusCode >= 500 {
+	// 2. Concurrency Semaphore Gate (max 150 in-flight requests to backends)
+	select {
+	case lb.sem <- struct{}{}:
+		defer func() { <-lb.sem }()
+	case <-r.Context().Done():
 		atomic.AddInt64(&lb.totalErrors, 1)
-		elapsed := float64(time.Since(start).Milliseconds())
-		log.Printf("[proxy] %s %s → %s status=%d latency=%.1fms",
-			r.Method, r.URL.Path, b.URL, rw.statusCode, elapsed)
+		return
+	case <-time.After(8 * time.Second):
+		atomic.AddInt64(&lb.totalErrors, 1)
+		http.Error(w, `{"error":"queue timeout"}`, http.StatusGatewayTimeout)
+		return
 	}
+
+	// Buffer small request body for retry resilience (< 1MB)
+	var bodyBytes []byte
+	if (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && r.ContentLength != 0 {
+		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	}
+
+	// High Availability: Try primary backend, transparently retry on peer if 5xx or drop
+	var chosen *Backend
+	var lastStatus int = 502
+
+	for attempt := 0; attempt < 2; attempt++ {
+		chosen = lb.pickExcluding(chosen)
+		if chosen == nil {
+			break
+		}
+
+		if len(bodyBytes) > 0 {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+			r.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
+		}
+
+		atomic.AddInt64(&chosen.activeConns, 1)
+		start := time.Now()
+
+		rw := &retryResponseWriter{target: w}
+		chosen.proxy.ServeHTTP(rw, r)
+
+		atomic.AddInt64(&chosen.activeConns, -1)
+		elapsed := float64(time.Since(start).Milliseconds())
+		chosen.updateLatency(elapsed, lb.cfg.LBAlpha)
+
+		lastStatus = rw.statusCode
+		if lastStatus < 500 {
+			// Succeeded: flush response to client
+			rw.FlushToTarget()
+			return
+		}
+
+		// Failed on this backend — log and retry
+		log.Printf("[retry] %s %s on %s status=%d (retrying on peer)", r.Method, r.URL.Path, chosen.URL, lastStatus)
+	}
+
+	// All attempts failed
+	atomic.AddInt64(&lb.totalErrors, 1)
+	http.Error(w, `{"error":"backend failure"}`, http.StatusBadGateway)
 }
 
 // ---------------------------------------------------------------------------
-// Self-health response
+// Health & Metrics Responses
 // ---------------------------------------------------------------------------
 
 type backendStatus struct {
@@ -510,7 +590,6 @@ type backendStatus struct {
 }
 
 func (lb *LB) serveHealth(w http.ResponseWriter, r *http.Request) {
-	// compute scores
 	var maxConns, maxLat, maxCpu float64 = 1, 1, 1
 	for _, b := range lb.backends {
 		b.mu.RLock()
@@ -533,49 +612,40 @@ func (lb *LB) serveHealth(w http.ResponseWriter, r *http.Request) {
 		statuses[i] = backendStatus{
 			URL:         b.URL,
 			Healthy:     b.healthy,
-			LatencyMs:   b.latencyEWMA,
+			LatencyMs:   math.Round(b.latencyEWMA*100) / 100,
 			CpuPct:      b.cpuPct,
 			ActiveConns: atomic.LoadInt64(&b.activeConns),
-			Score:       b.score(lb.cfg, maxConns, maxLat, maxCpu),
+			Score:       math.Round(b.score(lb.cfg, maxConns, maxLat, maxCpu)*1000) / 1000,
 		}
 		b.mu.RUnlock()
 	}
 
-	resp := map[string]any{
-		"status":         "ok",
-		"uptime_sec":     int(time.Since(lb.startTime).Seconds()),
-		"total_requests": atomic.LoadInt64(&lb.totalRequests),
-		"total_errors":   atomic.LoadInt64(&lb.totalErrors),
-		"threshold":      lb.cfg.Threshold,
-		"backends":       statuses,
-	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":   "ok",
+		"backends": statuses,
+	})
 }
-
-// ---------------------------------------------------------------------------
-// Aggregated metrics response (for reporting/load generator)
-// ---------------------------------------------------------------------------
 
 func (lb *LB) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	type bm struct {
-		URL         string  `json:"url"`
-		Healthy     bool    `json:"healthy"`
-		CpuPct      float64 `json:"cpu_pct"`
-		MemPct      float64 `json:"mem_pct"`
-		LatencyMs   float64 `json:"latency_ewma_ms"`
-		ActiveConns int64   `json:"active_connections"`
+		URL               string  `json:"url"`
+		Healthy           bool    `json:"healthy"`
+		ActiveConnections float64 `json:"active_connections"`
+		CpuPct            float64 `json:"cpu_pct"`
+		MemPct            float64 `json:"mem_pct"`
+		LatencyEWMA       float64 `json:"latency_ewma_ms"`
 	}
 	var bms []bm
 	for _, b := range lb.backends {
 		b.mu.RLock()
 		bms = append(bms, bm{
-			URL:         b.URL,
-			Healthy:     b.healthy,
-			CpuPct:      b.cpuPct,
-			MemPct:      b.memPct,
-			LatencyMs:   b.latencyEWMA,
-			ActiveConns: atomic.LoadInt64(&b.activeConns),
+			URL:               b.URL,
+			Healthy:           b.healthy,
+			ActiveConnections: math.Max(float64(atomic.LoadInt64(&b.activeConns)), b.remoteActiveConn),
+			CpuPct:            b.cpuPct,
+			MemPct:            b.memPct,
+			LatencyEWMA:       math.Round(b.latencyEWMA*100) / 100,
 		})
 		b.mu.RUnlock()
 	}
@@ -590,99 +660,84 @@ func (lb *LB) serveMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Response writer wrapper (capture status code)
-// ---------------------------------------------------------------------------
-
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Hijack implements http.Hijacker.
-// Required for WebSocket upgrade: httputil.ReverseProxy calls Hijack() to take
-// over the raw TCP connection for bidirectional proxying. Without this, every
-// WebSocket connection fails with "can't switch protocols using non-Hijacker
-// ResponseWriter type *main.responseWriter".
-func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, fmt.Errorf(
-			"responseWriter: underlying %T does not implement http.Hijacker",
-			rw.ResponseWriter,
-		)
-	}
-	return hijacker.Hijack()
-}
-
-// Flush implements http.Flusher.
-// Needed for streaming responses (SSE, chunked transfer).
-func (rw *responseWriter) Flush() {
-	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 func main() {
-	// Raise OS file descriptor limit so 2000+ concurrent connections succeed
+	// 1. Raise OS file descriptor limit to maximum allowed
 	var rLimit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
-		if rLimit.Cur < 65535 {
-			rLimit.Cur = 65535
-			if rLimit.Max < 65535 {
-				rLimit.Cur = rLimit.Max
-			}
+		oldCur := rLimit.Cur
+		if rLimit.Cur < rLimit.Max {
+			rLimit.Cur = rLimit.Max
 			_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 		}
+		log.Printf("[system] File descriptors: soft=%d -> %d (max=%d)", oldCur, rLimit.Cur, rLimit.Max)
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	cfg := loadConfig()
 
-	log.Printf("=== Group Chat Load Balancer ===")
-	log.Printf("Algorithm : Adaptive Weighted Least-Connections (AWLC)")
+	log.Printf("=== Group Chat Load Balancer (HA Bounded) ===")
 	log.Printf("Listen    : %s", cfg.ListenAddr)
-	log.Printf("Threshold : %.2f", cfg.Threshold)
-	log.Printf("Weights   : conn=%.2f lat=%.2f cpu=%.2f", cfg.WConn, cfg.WLat, cfg.WCpu)
-	log.Printf("Backends  :")
-	for _, u := range cfg.BackendURLs {
-		log.Printf("  • %s", u)
-	}
+	log.Printf("Backends  : %s", strings.Join(cfg.BackendURLs, ", "))
 
 	lb := newLB(cfg)
 
-	// Run background loops
+	// Run background health & metrics loops
 	go lb.healthLoop()
 	go lb.metricsLoop()
 
-	// Initial metrics scrape (don't wait 5 s for first data)
+	// Initial metrics scrape
 	client := &http.Client{Timeout: cfg.HealthTimeout}
 	for _, b := range lb.backends {
 		go lb.scrapeMetrics(client, b)
 	}
 
+	// 2. Real-Time Heartbeat Logger (every 5 seconds)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		var m runtime.MemStats
+		for range ticker.C {
+			runtime.ReadMemStats(&m)
+			totalReq := atomic.LoadInt64(&lb.totalRequests)
+			totalErr := atomic.LoadInt64(&lb.totalErrors)
+			inFlight := len(lb.sem)
+
+			var bStats []string
+			for _, b := range lb.backends {
+				b.mu.RLock()
+				h := "UP"
+				if !b.healthy {
+					h = "DOWN"
+				}
+				bStats = append(bStats, fmt.Sprintf("%s:%s(lat=%.0fms,act=%d)", b.URL, h, b.latencyEWMA, atomic.LoadInt64(&b.activeConns)))
+				b.mu.RUnlock()
+			}
+			log.Printf("[heartbeat] reqs=%d errs=%d inflight=%d/150 heap=%dMB sys=%dMB g=%d | %s",
+				totalReq, totalErr, inFlight, m.Alloc/(1024*1024), m.Sys/(1024*1024), runtime.NumGoroutine(), strings.Join(bStats, " "))
+		}
+	}()
+
+	// 3. Create TCP listener with clamped 8KB socket buffers
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", cfg.ListenAddr, err)
+	}
+	defer ln.Close()
+
+	clampedLn := clampedListener{ln}
+
 	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: lb,
-		// ReadTimeout / WriteTimeout must be 0 (disabled) so long-lived
-		// WebSocket connections are not killed by the server after 30 s.
-		// The WS ping/pong in the Python backend handles keepalives.
+		Handler:      lb,
 		ReadTimeout:  0,
 		WriteTimeout: 0,
 		IdleTimeout:  15 * time.Second,
 	}
 
-	fmt.Printf("\nLoad Balancer listening on http://0.0.0.0%s\n", cfg.ListenAddr)
-	if err := server.ListenAndServe(); err != nil {
+	fmt.Printf("\nLoad Balancer listening on http://0.0.0.0%s (clamped 8KB sockets, 150-worker gate, auto-retry)\n", cfg.ListenAddr)
+	if err := server.Serve(clampedLn); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
