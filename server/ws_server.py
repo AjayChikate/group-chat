@@ -31,7 +31,7 @@ class WSServer:
     # Asyncio loop access — captured once from the first request
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         if self._loop is None:
-            self._loop = asyncio.get_event_loop()
+            self._loop = asyncio.get_running_loop()
         return self._loop
 
     # -----------------------------------------------------------------------
@@ -75,7 +75,9 @@ class WSServer:
         while client.get('connected', False):
             try:
                 payload = await q.get()
-                await ws.send_text(payload)
+                # 5-second timeout: if TCP send buffer is full (slow client),
+                # drop the connection instead of stalling this task forever.
+                await asyncio.wait_for(ws.send_text(payload), timeout=5.0)
                 q.task_done()
             except asyncio.CancelledError:
                 break
@@ -275,7 +277,7 @@ class WSServer:
 
         # Fire-and-forget the key persistence — only hits MongoDB on first-ever join
         # for this username; subsequent joins are a no-op due to in-memory cache check.
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             store.async_save_user_public_key(username, pub_key.public_bytes_raw())
         )
 
@@ -353,7 +355,7 @@ class WSServer:
 
         # Persist asynchronously in background — fire and forget.
         # The message is already visible to all clients; DB is for durability.
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             store.async_append_message(client['room'], msg, client.get('private_key'))
         )
 
@@ -393,7 +395,7 @@ class WSServer:
 
         # Persist in background
         pair_key = '__'.join(sorted([client['username'].lower(), target_name.lower()]))
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             store.async_append_message(f'dm-{pair_key}', dm, client.get('private_key'))
         )
 

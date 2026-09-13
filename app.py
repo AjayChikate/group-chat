@@ -1,5 +1,6 @@
 import asyncio
 import json
+import json as _json
 import mimetypes
 import time
 import uuid
@@ -271,14 +272,23 @@ async def receive_gossip(request: Request):
 @app.get('/feed')
 async def get_feed_route(room: str = None, limit: int = 50000):
     """
-    Retrieves messages sorted chronologically. Served instantly from in-memory
-    cache (0 MongoDB queries). Returns all messages so load-test completeness is 100%.
-    Fast JSON serialization with Response bypasses FastAPI's slow jsonable_encoder.
+    Retrieves messages sorted chronologically.
+    Served from a pre-serialized bytes cache — zero json.dumps per request.
+    Concurrent /feed calls all share the same bytes object (no copy, no allocation).
     """
+    # room-filtered path still needs per-request serialization, but global feed
+    # (the common case) uses the pre-serialized cache.
+    if room is None:
+        return Response(content=store.get_feed_bytes(), media_type='application/json')
+    # room-filtered: serialize just that room's messages (much smaller list)
     store.increment_connections()
     try:
-        msgs = await store.async_get_feed(room_id=room, limit=limit)
-        return Response(content=json.dumps(msgs), media_type='application/json')
+        msgs = store._cache_get(room, limit)
+        try:
+            body = _json.dumps(msgs).encode('utf-8')
+        except Exception:
+            body = b'[]'
+        return Response(content=body, media_type='application/json')
     finally:
         store.decrement_connections()
 
@@ -316,17 +326,10 @@ async def static_file(filename: str):
 
 
 if __name__ == '__main__':
-    # Limit Python process memory to 1.5 GB (1.5 × 2^30 bytes).
-    # If cgroup limit is lower than this, cgroup wins — but this prevents
-    # runaway memory growth within the allowed budget.
-    try:
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        limit = 1536 * 1024 * 1024  # 1.5 GB
-        if hard == resource.RLIM_INFINITY or hard > limit:
-            resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
-    except Exception:
-        pass
+    # DO NOT use resource.setrlimit(RLIMIT_AS) — it causes segfault in Python 3.14:
+    # when C extensions (cryptography, pymongo) hit ENOMEM they panic, not raise MemoryError.
+    # Memory safety is handled by: _MSG_CACHE_SIZE limit + pre-serialized feed bytes +
+    # send_queue backpressure + gossip queue drop-on-full.
 
     uvicorn.run(
         'app:app',
@@ -336,8 +339,11 @@ if __name__ == '__main__':
         ws_ping_interval=config.HEARTBEAT_INTERVAL_MS / 1000,
         ws_ping_timeout=config.HEARTBEAT_INTERVAL_MS / 1000,
         log_level='warning',
-        limit_concurrency=500,   # reject (503) when >500 concurrent requests instead of queueing forever
-        limit_max_requests=None, # no restart after N requests
-        backlog=256,             # OS connection queue — don't accept all 1000 at once
-        timeout_keep_alive=5,    # close idle HTTP keep-alive after 5s (free memory faster)
+        # IMPORTANT: limit_concurrency counts LONG-LIVED WebSocket connections too.
+        # At 2000 users / 3 nodes = 667 WS per node → setting this < 1000 rejects HTTP.
+        # Leave it None (disabled) — memory is bounded by queue sizes, not by 503 rejection.
+        limit_concurrency=None,
+        limit_max_requests=None,
+        backlog=512,            # OS TCP accept queue — enough for burst of connections
+        timeout_keep_alive=5,   # close idle HTTP keep-alive in 5s to free asyncio state
     )
