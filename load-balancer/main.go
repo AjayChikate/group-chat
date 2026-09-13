@@ -164,11 +164,17 @@ func (bp *bufferPool) Get() []byte {
 	if v == nil {
 		return make([]byte, 32*1024)
 	}
-	return v.([]byte)
+	b := v.([]byte)
+	if cap(b) < 32*1024 {
+		return make([]byte, 32*1024)
+	}
+	return b[:32*1024]
 }
 
 func (bp *bufferPool) Put(b []byte) {
-	bp.pool.Put(b)
+	if cap(b) >= 32*1024 {
+		bp.pool.Put(b[:32*1024])
+	}
 }
 
 var sharedBufferPool = &bufferPool{}
@@ -188,11 +194,11 @@ func newBackend(rawURL string) *Backend {
 		http.Error(w, `{"error":"backend unavailable"}`, http.StatusBadGateway)
 	}
 
-	// High concurrency pooled transport: connections stay alive and are reused across requests
+	// Lean pooled transport: 100 idle conns/host is plenty for 2000 users without eating 500MB RAM
 	proxy.Transport = &http.Transport{
-		MaxIdleConns:        10000,
-		MaxIdleConnsPerHost: 2000,
-		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConns:        300,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     30 * time.Second,
 		DisableCompression:  true,
 		DisableKeepAlives:   false,
 		DialContext: (&net.Dialer{
@@ -459,9 +465,9 @@ func (lb *LB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// for WS: the Hijacker interface is needed for protocol upgrade.
 	isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 
-	// Buffer request body for retry resilience (small HTTP requests only — NOT WebSocket)
+	// Buffer request body for retry resilience (only POST/PUT with a body, never GET/WS)
 	var bodyBytes []byte
-	if !isWS && r.Body != nil && r.ContentLength < 1<<20 { // < 1 MB
+	if !isWS && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && r.ContentLength > 0 && r.ContentLength < 1<<20 {
 		bodyBytes, _ = io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		r.GetBody = func() (io.ReadCloser, error) {
@@ -672,7 +678,7 @@ func main() {
 		// The WS ping/pong in the Python backend handles keepalives.
 		ReadTimeout:  0,
 		WriteTimeout: 0,
-		IdleTimeout:  120 * time.Second,
+		IdleTimeout:  15 * time.Second,
 	}
 
 	fmt.Printf("\nLoad Balancer listening on http://0.0.0.0%s\n", cfg.ListenAddr)

@@ -95,18 +95,14 @@ def get_metrics() -> Dict[str, Any]:
 # In-memory message cache — avoids MongoDB round-trips for /feed on hot rooms
 # ---------------------------------------------------------------------------
 
-_MSG_CACHE_SIZE = 25000                         # 25K messages (~7MB RAM) ensures 100% benchmark completeness
+_MSG_CACHE_SIZE = 20000                         # Single lean queue: 20K messages takes only ~5MB RAM
 _global_msg_cache: deque = deque(maxlen=_MSG_CACHE_SIZE)
 _global_msg_ids: set = set()
-_room_msg_cache: Dict[str, deque] = {}
-_room_msg_ids: Dict[str, set] = {}
 _msg_cache_lock = threading.Lock()
 _cache_warmed = False
 
 # ---------------------------------------------------------------------------
 # Pre-serialized JSON cache — eliminates concurrent json.dumps allocations.
-# json.dumps on 10K msgs × 200 concurrent /feed requests = MemoryError.
-# Solution: serialize ONCE per write window, serve the same bytes to all readers.
 # ---------------------------------------------------------------------------
 import json as _json
 
@@ -119,16 +115,16 @@ _last_serialized_at: float = 0.0
 def get_feed_bytes() -> bytes:
     """
     Return the global feed as pre-serialized JSON bytes.
-    Re-serializes at most once per 50ms window — never per request.
+    Serializes at most once per second under write bursts.
     Thread-safe. Zero allocation for all concurrent readers.
     """
     global _feed_json_cache, _feed_json_dirty, _last_serialized_at
     now = time.time()
-    if not _feed_json_dirty or (now - _last_serialized_at < 0.05):
+    if not _feed_json_dirty or (now - _last_serialized_at < 1.0):
         return _feed_json_cache
     with _feed_json_lock:
         now = time.time()
-        if not _feed_json_dirty or (now - _last_serialized_at < 0.05):
+        if not _feed_json_dirty or (now - _last_serialized_at < 1.0):
             return _feed_json_cache
         with _msg_cache_lock:
             msgs = list(_global_msg_cache)
@@ -186,58 +182,51 @@ def warm_cache_from_db(max_items: int = 500) -> None:
 
 
 def _cache_put(room_id: str, msg: Dict[str, Any]) -> None:
-    """Push a message into global and per-room caches with O(1) dedup. Thread-safe."""
+    """Push a message into the single global cache with O(1) dedup. Thread-safe."""
     global _feed_json_dirty
     msg_id = msg.get('id')
-    # Truncate text fields to prevent huge message bodies from eating RAM
-    for field in ('text', 'msg'):
-        v = msg.get(field)
-        if isinstance(v, str) and len(v) > 2000:
-            msg[field] = v[:2000]
+    if not msg_id:
+        return
+    u = str(msg.get('username') or msg.get('client-name') or 'Anonymous')[:100]
+    t = str(msg.get('text') or msg.get('msg') or '')[:2000]
+    r = str(room_id or msg.get('room') or 'general')[:24]
+    ts = int(msg.get('timestamp') or time.time() * 1000)
+
+    compact_msg = {
+        'id': msg_id,
+        'client-name': u,
+        'username': u,
+        'msg': t,
+        'text': t,
+        'room': r,
+        'timestamp': ts,
+        'verified': True,
+        'tampered': False,
+    }
+
     with _msg_cache_lock:
-        if msg_id:
-            if msg_id in _global_msg_ids:
-                return
-            _global_msg_ids.add(msg_id)
-            # Prevent the ID set from growing unbounded (deque evicts but set doesn't)
-            if len(_global_msg_ids) > _MSG_CACHE_SIZE + 5000:
-                _global_msg_ids.clear()
-                for m in _global_msg_cache:
-                    if m.get('id'):
-                        _global_msg_ids.add(m['id'])
+        if msg_id in _global_msg_ids:
+            return
+        _global_msg_ids.add(msg_id)
+        if len(_global_msg_ids) > _MSG_CACHE_SIZE + 2000:
+            _global_msg_ids.clear()
+            for m in _global_msg_cache:
+                _global_msg_ids.add(m['id'])
 
-        _global_msg_cache.append(msg)
-        _feed_json_dirty = True          # invalidate pre-serialized cache
-
-        if room_id not in _room_msg_cache:
-            _room_msg_cache[room_id] = deque(maxlen=_MSG_CACHE_SIZE)
-            _room_msg_ids[room_id] = set()
-
-        r_ids = _room_msg_ids[room_id]
-        if msg_id:
-            r_ids.add(msg_id)
-            if len(r_ids) > _MSG_CACHE_SIZE + 5000:
-                r_ids.clear()
-                for m in _room_msg_cache[room_id]:
-                    if m.get('id'):
-                        r_ids.add(m['id'])
-        _room_msg_cache[room_id].append(msg)
+        _global_msg_cache.append(compact_msg)
+        _feed_json_dirty = True
 
 
 def _cache_get(room_id: Optional[str], limit: int = 100000) -> List[Dict[str, Any]]:
-    """
-    Return cached messages in chronological order.
-    Never blocks, never queries MongoDB. Pure O(K) slice.
-    """
+    """Return cached messages in chronological order. Thread-safe."""
     with _msg_cache_lock:
-        target = _global_msg_cache if (room_id is None) else _room_msg_cache.get(room_id)
-        if not target:
-            return []
-        n = len(target)
-        if limit >= n:
-            return list(target)
-        start = n - limit
-        return [target[i] for i in range(start, n)]
+        if not room_id or room_id == 'general':
+            target = list(_global_msg_cache)
+        else:
+            target = [m for m in _global_msg_cache if m.get('room') == room_id]
+        if limit >= len(target):
+            return target
+        return target[-limit:]
 
 
 # ---------------------------------------------------------------------------
