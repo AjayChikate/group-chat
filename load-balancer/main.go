@@ -94,7 +94,7 @@ func loadConfig() Config {
 		listenAddr = ":" + v
 	}
 
-	maxInFlight := 120
+	maxInFlight := 450
 	if v := os.Getenv("LB_MAX_INFLIGHT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			maxInFlight = n
@@ -104,19 +104,19 @@ func loadConfig() Config {
 	return Config{
 		ListenAddr:      listenAddr,
 		BackendURLs:     strings.Split(backends, ","),
-		HealthInterval:  4 * time.Second,
-		MetricsInterval: 4 * time.Second,
-		HealthTimeout:   3 * time.Second,
-		ProxyTimeout:    15 * time.Second,
-		UnhealthyAfter:  4,
+		HealthInterval:  5 * time.Second,
+		MetricsInterval: 5 * time.Second,
+		HealthTimeout:   6 * time.Second,
+		ProxyTimeout:    20 * time.Second,
+		UnhealthyAfter:  6,
 		HealthyAfter:    2,
 		Threshold:       threshold,
 		WConn:           wConn,
 		WLat:            wLat,
 		WCpu:            wCpu,
-		LBAlpha:         0.25,
+		LBAlpha:         0.40,
 		MaxInFlight:     maxInFlight,
-		MaxActiveConns:  4000,
+		MaxActiveConns:  5000,
 	}
 }
 
@@ -127,16 +127,16 @@ func loadConfig() Config {
 
 type trackedConn struct {
 	net.Conn
-	closed atomic.Bool
+	once    sync.Once
 	onClose func()
 }
 
 func (c *trackedConn) Close() error {
-	if c.closed.CompareAndSet(false, true) {
+	c.once.Do(func() {
 		if c.onClose != nil {
 			c.onClose()
 		}
-	}
+	})
 	return c.Conn.Close()
 }
 
@@ -326,11 +326,11 @@ func newBackend(rawURL string, lb *LB) *Backend {
 
 	// High-performance warm connection pool (keeps connections open, zero socket churn)
 	transport := &http.Transport{
-		MaxIdleConns:        300,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     150,
+		MaxIdleConns:        600,
+		MaxIdleConnsPerHost: 200,
+		MaxConnsPerHost:     300,
 		IdleConnTimeout:     90 * time.Second,
-		ResponseHeaderTimeout: 12 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 		DisableCompression:  true,
 		DisableKeepAlives:   false,
 		ForceAttemptHTTP2:   false,
@@ -575,9 +575,9 @@ func (lb *LB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Concurrency Semaphore & Graceful Load Shedding (System Design Queuing)
-	// If backend pool is fully saturated, queue for at most 2.5 seconds.
+	// If backend pool is fully saturated, queue for at most 6.0 seconds.
 	// Context timeout cancels cleanly with ZERO timer leak.
-	ctx, cancel := context.WithTimeout(r.Context(), 2500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(r.Context(), 6000*time.Millisecond)
 	defer cancel()
 
 	select {
@@ -820,8 +820,8 @@ func main() {
 			log.Printf("[heartbeat] reqs=%d dropped=%d errs=%d inflight=%d/%d conns=%d heap=%dMB sys=%dMB rss=%dMB g=%d | %s",
 				totalReq, totalDrop, totalErr, inFlight, cfg.MaxInFlight, activeTCP, heapMB, sysMB, rssMB, runtime.NumGoroutine(), strings.Join(bStats, " "))
 
-			// Early warning alarm if memory approaches dangerous levels
-			if sysMB > 60 || rssMB > 60 {
+			// Early warning alarm if memory approaches dangerous levels (>120MB)
+			if sysMB > 120 || rssMB > 120 {
 				log.Printf("⚠️ [ALERT-MEM] Memory pressure detected: sys=%dMB rss=%dMB (cgroup limit=512MB)", sysMB, rssMB)
 			}
 		}

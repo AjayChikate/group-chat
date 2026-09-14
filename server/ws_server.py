@@ -75,9 +75,9 @@ class WSServer:
         while client.get('connected', False):
             try:
                 payload = await q.get()
-                # 5-second timeout: if TCP send buffer is full (slow client),
-                # drop the connection instead of stalling this task forever.
-                await asyncio.wait_for(ws.send_text(payload), timeout=5.0)
+                # 0.5-second timeout: if TCP send buffer is full (slow client),
+                # drop connection quickly so event loop stays completely responsive
+                await asyncio.wait_for(ws.send_text(payload), timeout=0.5)
                 q.task_done()
             except asyncio.CancelledError:
                 break

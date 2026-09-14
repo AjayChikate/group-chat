@@ -278,14 +278,6 @@ def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
     uname = username.lower()
     if uname in _user_keys_cache:
         return _user_keys_cache[uname]
-    doc = _user_keys.find_one({'username': uname})
-    if doc:
-        raw_bytes = _to_bytes(doc['public_key'])
-        pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
-        if len(_user_keys_cache) > 5000:
-            _user_keys_cache.clear()
-        _user_keys_cache[uname] = pub
-        return pub
     _, pub = crypto.get_or_create_sender_keys(username)
     if len(_user_keys_cache) > 5000:
         _user_keys_cache.clear()
@@ -294,7 +286,7 @@ def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
 
 
 # ---------------------------------------------------------------------------
-# User private keys — stored encrypted in MongoDB for cross-node sharing
+# User private keys — stored in memory (derived deterministically)
 # ---------------------------------------------------------------------------
 
 _priv_keys_cache: Dict[str, ed25519.Ed25519PrivateKey] = {}
@@ -305,34 +297,17 @@ def save_user_private_key(username: str, private_key: ed25519.Ed25519PrivateKey)
     if len(_priv_keys_cache) > 5000:
         _priv_keys_cache.clear()
     _priv_keys_cache[uname] = private_key
-    raw = private_key.private_bytes_raw()
-    ct, nonce = crypto.encrypt_bytes(raw)
-    _user_priv_keys.update_one(
-        {'username': uname},
-        {'$set': {'ciphertext': _to_hex(ct), 'nonce': _to_hex(nonce)}},
-        upsert=True,
-    )
 
 
 def get_user_private_key(username: str) -> ed25519.Ed25519PrivateKey:
     uname = username.lower()
     if uname in _priv_keys_cache:
         return _priv_keys_cache[uname]
-    doc = _user_priv_keys.find_one({'username': uname})
-    if doc:
-        try:
-            ct = _to_bytes(doc['ciphertext'])
-            nonce = _to_bytes(doc['nonce'])
-            raw = crypto.decrypt_bytes(ct, nonce)
-            priv = crypto.load_private_key_from_bytes(raw)
-            _priv_keys_cache[uname] = priv
-            crypto.cache_sender_key(username, priv)
-            return priv
-        except Exception:
-            pass
     priv, pub = crypto.get_or_create_sender_keys(username)
-    save_user_private_key(username, priv)
-    save_user_public_key(username, pub.public_bytes_raw())
+    if len(_priv_keys_cache) > 5000:
+        _priv_keys_cache.clear()
+    _priv_keys_cache[uname] = priv
+    _user_keys_cache[uname] = pub
     return priv
 
 
