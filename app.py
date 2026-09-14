@@ -28,6 +28,29 @@ ws_server = WSServer(room_manager, logger)
 _start_time = time.time()
 
 
+import gc
+import os
+import psutil
+
+async def _memory_monitor_loop():
+    proc = psutil.Process(os.getpid())
+    while True:
+        try:
+            await asyncio.sleep(10.0)
+            rss_mb = int(proc.memory_info().rss / (1024 * 1024))
+            conns = store._active_connections
+            cache_len = len(store._global_msg_cache)
+            q_depth = store._write_queue.qsize() if store._write_queue else 0
+            print(f"[{config.SERVER_ID}] [heartbeat] rss={rss_mb}MB conns={conns} cache={cache_len} db_queue={q_depth}")
+            if rss_mb > 120:
+                print(f"[{config.SERVER_ID}] ⚠️ Memory pressure ({rss_mb}MB), triggering gc.collect()")
+                gc.collect()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     store.init_batch_writer()
@@ -36,8 +59,9 @@ async def lifespan(application: FastAPI):
     try:
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, store.warm_cache_from_db)
+        monitor_task = loop.create_task(_memory_monitor_loop())
     except Exception:
-        pass
+        monitor_task = None
 
     logger.log(
         'server_start',
@@ -50,6 +74,8 @@ async def lifespan(application: FastAPI):
     yield
 
     logger.log('server_shutdown', server_id=config.SERVER_ID)
+    if monitor_task:
+        monitor_task.cancel()
     ws_server.shutdown()
     await gossip.shutdown_gossip()
     await store.shutdown_batch_writer()

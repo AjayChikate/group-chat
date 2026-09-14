@@ -282,9 +282,13 @@ def get_user_public_key(username: str) -> Optional[ed25519.Ed25519PublicKey]:
     if doc:
         raw_bytes = _to_bytes(doc['public_key'])
         pub = ed25519.Ed25519PublicKey.from_public_bytes(raw_bytes)
+        if len(_user_keys_cache) > 5000:
+            _user_keys_cache.clear()
         _user_keys_cache[uname] = pub
         return pub
     _, pub = crypto.get_or_create_sender_keys(username)
+    if len(_user_keys_cache) > 5000:
+        _user_keys_cache.clear()
     _user_keys_cache[uname] = pub
     return pub
 
@@ -298,6 +302,8 @@ _priv_keys_cache: Dict[str, ed25519.Ed25519PrivateKey] = {}
 
 def save_user_private_key(username: str, private_key: ed25519.Ed25519PrivateKey) -> None:
     uname = username.lower()
+    if len(_priv_keys_cache) > 5000:
+        _priv_keys_cache.clear()
     _priv_keys_cache[uname] = private_key
     raw = private_key.private_bytes_raw()
     ct, nonce = crypto.encrypt_bytes(raw)
@@ -377,14 +383,15 @@ async def _batch_writer_loop() -> None:
             batch.append(doc)
             _write_queue.task_done()
 
+            # Dynamic micro-batching: drain up to 500 items if queue is backlogged
+            max_batch = 500 if _write_queue.qsize() > 50 else 100
             start_t = time.time()
-            while len(batch) < 100 and (time.time() - start_t) < 0.05:
+            while len(batch) < max_batch and (time.time() - start_t) < 0.04:
                 try:
                     d = _write_queue.get_nowait()
                     batch.append(d)
                     _write_queue.task_done()
                 except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.01)
                     break
         except asyncio.CancelledError:
             while _write_queue and not _write_queue.empty():
