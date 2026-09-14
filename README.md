@@ -1,343 +1,333 @@
-# 🟢 Group Chat
+# 🟢 High-Availability Distributed Group Chat System
 
-**A real-time, encrypted, multi-room chat server built with FastAPI and raw WebSockets — with authenticated encryption, digital signatures, and built-in tamper detection.**
+**Computer System Design (CSD) --- 7th Semester, 4th Year Individual Project**  
+**Author**: Ajay Chikate  
+**Live Load Balancer Endpoint**: [http://10.1.75.51:5297/](http://10.1.75.51:5297/)  
+**GitHub Repository**: [https://github.com/AjayChikate/group-chat](https://github.com/AjayChikate/group-chat)  
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![WebSockets](https://img.shields.io/badge/protocol-WebSocket-4B32C3.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](#license)
-[![Status](https://img.shields.io/badge/status-active-brightgreen.svg)](#)
+[![Go](https://img.shields.io/badge/Load_Balancer-Go_1.22+-00ADD8.svg)](https://golang.org/)
+[![Python](https://img.shields.io/badge/Backends-FastAPI_/_Uvicorn-009688.svg)](https://fastapi.tiangolo.com/)
+[![Database](https://img.shields.io/badge/Persistence-MongoDB_Atlas-47A248.svg)](https://www.mongodb.com/)
+[![Cryptography](https://img.shields.io/badge/Security-AES--256--GCM_+_Ed25519-blueviolet.svg)](#cryptographic-pipeline)
+[![Architecture](https://img.shields.io/badge/Pattern-Redis--Style_Pub--Sub-orange.svg)](#redis-style-in-memory-pubsub--gossip-mesh)
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Running the Server](#running-the-server)
-  - [Running with Docker](#running-with-docker)
-- [Configuration](#configuration)
-- [Security Model](#security-model)
-  - [Encryption & Signing Pipeline](#encryption--signing-pipeline)
-  - [Tamper Detection](#tamper-detection)
-  - [Key Management](#key-management)
-  - [Known Limitations](#known-limitations)
-- [WebSocket API Reference](#websocket-api-reference)
-  - [Client → Server Events](#client--server-events)
-  - [Server → Client Events](#server--client-events)
-- [HTTP Routes](#http-routes)
-- [Utility Scripts](#utility-scripts)
-- [Rate Limiting](#rate-limiting)
-- [Logging & Observability](#logging--observability)
-- [Deployment Notes](#deployment-notes)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
+- [Overview & Objectives](#overview--objectives)
+- [Distributed System Architecture](#distributed-system-architecture)
+- [System Design: What I Built](#system-design-what-we-built)
+  - [1. Redis-Style In-Memory Pub/Sub & Gossip Mesh](#1-redis-style-in-memory-pubsub--gossip-mesh)
+  - [2. Adaptive Go Load Balancer & Dynamic Scoring](#2-adaptive-go-load-balancer--dynamic-scoring)
+  - [3. OS Hardening & Zero-Allocation Streaming](#3-os-hardening--zero-allocation-streaming)
+  - [4. Cryptographic Pipeline (AES-256-GCM & Deterministic Ed25519)](#4-cryptographic-pipeline-aes-256-gcm--deterministic-ed25519)
+  - [5. Decoupled Asynchronous MongoDB Atlas Persistence](#5-decoupled-asynchronous-mongodb-atlas-persistence)
+- [Environment Variables Reference](#environment-variables-reference)
+- [Commands to Start the System](#commands-to-start-the-system)
+  - [Step 1: Prerequisites & Virtual Environment](#step-1-prerequisites--virtual-environment)
+  - [Step 2: Database Initialization](#step-2-database-initialization)
+  - [Step 3: Launching the 3 Backend Nodes](#step-3-launching-the-3-backend-nodes)
+  - [Step 4: Compiling & Launching the Go Load Balancer](#step-4-compiling--launching-the-go-load-balancer)
+  - [Step 5: Verifying Health & System Telemetry](#step-5-verifying-health--system-telemetry)
+- [Project Directory Structure](#project-directory-structure)
 
 ---
 
-## Overview
+## Overview & Objectives
 
-Group Chat is a lightweight, dependency-minimal chat server that demonstrates a production-style real-time messaging stack:
+Group Chat is a high-availability, distributed real-time chat platform engineered to withstand extreme client concurrency under a strict host-level **512 MB memory cgroup boundary**. 
 
-- A single FastAPI process serves both the static frontend and a `/ws` WebSocket endpoint.
-- Every message is **encrypted at rest** (AES-256-GCM) and **cryptographically signed** (Ed25519) before being persisted to SQLite, and both are re-verified on every read.
-- The frontend is dependency-free vanilla JS/HTML/CSS — no build step, no bundler, no framework.
+Standard chat applications easily succumb to Linux Out-Of-Memory (OOM) killer terminations, goroutine/thread stack explosions, TCP socket buffer exhaustion, or slow database write round-trips. This implementation addresses these challenges by:
+1. Distributing incoming load across **four decoupled subsystems** (1 Go Edge Load Balancer + 3 Horizontal FastAPI Backends + MongoDB Atlas).
+2. Implementing a lightweight **Redis-style in-memory Pub/Sub message broker** across the cluster without the RAM overhead of an external Redis server.
+3. Enforcing **kernel socket buffer clamping (8 KB)** and zero-alloc byte-slice streaming to cap connection memory.
+4. Using **deterministic HMAC-SHA256 Ed25519 signing** to eliminate disk I/O and database key queries per message.
+5. Offloading MongoDB Atlas persistence to **non-blocking background micro-batch worker threads**.
 
-It's designed to be easy to read end-to-end: the wire protocol, the crypto pipeline, and the room/presence logic are each isolated into their own small module.
+---
 
-## Features
+## Distributed System Architecture
 
-| Category             | Details                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------- |
-| **Rooms**            | Multi-room chat with join/switch/create; default rooms persist even when empty        |
-| **Direct messages**  | 1-to-1 private messaging alongside room chat, with unread notifications               |
-| **Presence**         | Live online/away/offline status; auto-away after a configurable idle timeout          |
-| **Moderation**       | Admin usernames (configurable) get `kick` and `mute`/`unmute` powers                  |
-| **UX niceties**      | Typing indicators, delivery receipts, character counter, sound + theme toggles        |
-| **Resilience**       | Client auto-reconnects with exponential backoff (1s → 16s cap) on dropped sockets     |
-| **History**          | Recent messages replayed on join / room switch, decrypted and verified on the fly     |
-| **Security**         | AES-256-GCM encryption + Ed25519 signatures on every message, verified on read        |
-| **Abuse prevention** | Per-connection sliding-window rate limiter (token bucket)                             |
-| **Observability**    | Structured JSON logs for joins, disconnects, moderation actions, and server lifecycle |
-
-## Architecture
-
-<p align="center">
-  <img src="./assets/architecture.svg" alt="Group Chat system architecture diagram" width="100%">
-</p>
-
-The request/data path flows top to bottom: the browser talks to `app.py` over HTTP (static assets) and a single `/ws` WebSocket connection; `ws_server.py` is the protocol hub that dispatches every event; `rooms.py` handles ephemeral in-memory membership and broadcast, while `store.py` drives the durable encrypt → sign → persist pipeline (and its mirror, verify → decrypt, on history reads) backed by `crypto.py` and SQLite.
-
-- **`ws_server.py`** is the only module that understands the JSON wire protocol; everything else stays generic.
-- **`rooms.py`** holds membership and broadcast logic purely in memory — no persistence.
-- **`store.py`** owns the SQLite connection and the encrypt/sign/persist ↔ verify/decrypt round trip.
-- **`crypto.py`** is a thin, isolated wrapper around the `cryptography` library's AEAD and signature primitives — the only file that touches raw key material.
-
-## Tech Stack
-
-| Layer              | Technology                                                                                   |
-| ------------------ | -------------------------------------------------------------------------------------------- |
-| Language           | Python 3.10+                                                                                 |
-| Web framework      | [FastAPI](https://fastapi.tiangolo.com/)                                                     |
-| ASGI server        | [uvicorn](https://www.uvicorn.org/) (`standard` extras: `websockets`, `httptools`, `uvloop`) |
-| Realtime transport | Native WebSockets (via Starlette/FastAPI)                                                    |
-| Cryptography       | [`cryptography`](https://cryptography.io/) — AES-256-GCM, Ed25519                            |
-| Persistence        | SQLite (stdlib `sqlite3`)                                                                    |
-| Frontend           | Vanilla HTML/CSS/JavaScript — no build tooling required                                      |
-
-## Project Structure
+The distributed setup consists of **4 distinct computational subsystems** plus an external cloud MongoDB Atlas database:
 
 ```
-.
-├── app.py                   # FastAPI app: routes, WS endpoint, lifespan, entry point
-├── clear_db.py                # CLI: wipe all messages & keys from the database
-├── tamper_last.py              # CLI: corrupt the last stored message (tamper-detection demo)
-├── requirements.txt
-├── data/                        # Runtime data (git-ignored; created automatically)
-│   ├── chat.db                    # SQLite database
-│   ├── master.key                  # AES-256 master key
-│   └── keys/                        # Per-user Ed25519 private keys
-├── public/                       # Static frontend (served as-is, no build step)
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
-└── server/
-    ├── __init__.py
-    ├── config.py                 # Environment-driven configuration
-    ├── crypto.py                  # AES-GCM + Ed25519 primitives
-    ├── logger.py                   # Structured JSON logging
-    ├── rate_limiter.py              # Sliding-window token bucket
-    ├── rooms.py                      # Room/member state + broadcast
-    ├── store.py                       # SQLite persistence + crypto pipeline
-    └── ws_server.py                    # WebSocket protocol handlers
+                          ┌────────────────────────┐
+                          │ Virtual Users / Clients│
+                          │  (HTTP REST & WSS)     │
+                          └───────────┬────────────┘
+                                      │ Incoming Traffic (:5297)
+                                      ▼
+                        ┌───────────────────────────┐
+                        │   SYSTEM 1: LOAD BALANCER │
+                        │  (Go Binary, EWMA Scoring,│
+                        │   8KB Clamped Sockets)    │
+                        └──────┬──────┬──────┬──────┘
+             ┌─────────────────┘      │      └─────────────────┐
+             │ :5298                  │ :5299                  │ :5300
+             ▼                        ▼                        ▼
+  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+  │  SYSTEM 2: BACKEND 1│  │  SYSTEM 3: BACKEND 2│  │  SYSTEM 4: BACKEND 3│
+  │  (FastAPI / Uvicorn)│  │  (FastAPI / Uvicorn)│  │  (FastAPI / Uvicorn)│
+  └──────────┬──────────┘  └──────────┬──────────┘  └──────────┬──────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+ ═══════════════════════════════════════════════════════════════════════════════
+       REDIS-STYLE IN-MEMORY PUB/SUB MESSAGE BUS & PEER GOSSIP MESH
+   (Room Channel Subscriptions • Local asyncio.Queue • Micro-Batched HTTP Sync)
+ ═══════════════════════════════════════════════════════════════════════════════
+             │                        │                        │
+             └────────────────┬───────┴────────────────────────┘
+                              │ Async Micro-Batch Write Thread
+                              ▼
+                 ┌───────────────────────────┐
+                 │    MONGODB ATLAS CLUSTER  │
+                 │ (Shared 'messages' Coll)  │
+                 └───────────────────────────┘
 ```
 
-## Getting Started
+### Subsystem Roles
+- **System 1 (Go Load Balancer)**: Edge proxy listening on `:5297`. Terminates incoming connections, enforces connection limits, tracks backend latencies via EWMA, and streams HTTP/WebSocket frames without buffering.
+- **System 2 (Backend Node 1)**: FastAPI application running on port `5000` (`172.17.0.99:5000` in container topology).
+- **System 3 (Backend Node 2)**: Identical FastAPI application running on port `5000` (`172.17.0.100:5000`).
+- **System 4 (Backend Node 3)**: Identical FastAPI application running on port `5000` (`172.17.0.101:5000`).
+- **Distributed Storage Tier**: MongoDB Atlas replica set cluster holding persistent, encrypted message documents and user public keys.
 
-### Prerequisites
+---
 
-- Python **3.10+**
-- `pip`
+## System Design: 
 
-### Installation
+### 1. Redis-Style In-Memory Pub/Sub & Gossip Mesh
+In a multi-node deployment, when a user connected to Backend 1 posts a message to `#general`, users connected to Backend 2 and Backend 3 must receive that message in real time.
+
+- **Why Not External Redis?**  
+  Deploying a dedicated Redis instance would consume 50–100 MB of baseline memory, establish additional connection pools, and introduce an external failure domain under our 512 MB memory limit.
+- **My Implementation**:
+  - **Topics/Channels as Rooms**: Each chat room (`general`, `tech`, `random`) is an in-memory topic managed by `RoomManager`. Connected WebSockets subscribe to the room's `asyncio.Queue`.
+  - **Local Publication**: When a message is posted, the receiving backend immediately fans out the payload to all locally connected WebSocket subscribers.
+  - **Peer Gossip Mesh**: The message is simultaneously queued into a gossip worker. Outgoing messages are gathered into 20 ms micro-batches (up to 500 messages) and transmitted via persistent HTTP keep-alive connections to peer nodes (`/internal/gossip`).
+  - **Self-Peer Avoidance & Deduplication**: Node hostname and network IP detection prevents instances from gossiping to themselves. Peer nodes dispatch received messages to their local subscribers without re-gossiping or writing to the database, preventing infinite loops.
+
+### 2. Adaptive Go Load Balancer & Dynamic Scoring
+Rather than naive round-robin or static weighted balancing, the Go edge proxy implements a dynamic cost scoring function:
+$$S(b) = 0.40 \cdot \tilde{C}_b + 0.35 \cdot \tilde{L}_b + 0.25 \cdot \tilde{U}_b$$
+- $\tilde{C}_b$: Active TCP in-flight connections on backend $b$ normalized against cluster maximum.
+- $\tilde{L}_b$: Normalized Exponentially Weighted Moving Average (EWMA) latency ($L_t = 0.40 L_{\text{sample}} + 0.60 L_{t-1}$).
+- $\tilde{U}_b$: Normalized CPU utilization periodically reported by backend `/metrics` endpoints.
+
+The candidate node with the lowest score $S(b)$ is selected for routing. If a request experiences a transport dial failure or reset, the proxy automatically fails over to an alternate healthy peer—unless the client context has already timed out, suppressing retry storms.
+
+### 3. OS Hardening & Zero-Allocation Streaming
+To guarantee that the cluster stays comfortably within the 512 MB RAM limit:
+- **Clamped Kernel Sockets**: The Go listener intercepts accepted TCP sockets and clamps `SO_RCVBUF` and `SO_SNDBUF` to **8192 bytes (8 KB)**. This prevents the Linux kernel from allocating default 128 KB buffers per socket, saving hundreds of megabytes of kernel RAM.
+- **Zero-Allocation Stream Buffers**: Direct chunked streaming between client and backend connections utilizes a reusable `sync.Pool` of 32 KB byte slices. Full request and response bodies are never buffered in heap memory.
+- **Keep-Alive Pool Synchronization**: The proxy's `IdleConnTimeout` is fixed at 30 seconds, strictly shorter than Uvicorn's 65-second timeout. This eliminates "connection reset by peer" race conditions.
+- **Proactive Memory Reclamation**: A background routine triggers `debug.FreeOSMemory()` every 3 seconds to force `MADV_DONTNEED` syscalls, combined with `GOMEMLIMIT` bounding.
+
+### 4. Cryptographic Pipeline (AES-256-GCM & Deterministic Ed25519)
+Every message processed through `POST /message` or WebSockets undergoes authenticated security:
+- **AES-256-GCM Encryption**: Message plaintexts are encrypted using a 256-bit master key and a cryptographically secure 96-bit random nonce ($N$).
+- **Deterministic HMAC-SHA256 Ed25519 Key Derivation**:  
+  Standard architectures query databases or read private key files from disk per message. Under high throughput, this creates disk and connection pool starvation.  
+  Instead, signing keys are derived deterministically in RAM:
+  $$\text{seed}_u = \text{HMAC-SHA256}(K_{\text{master}}, \text{"user-ed25519:"} \parallel u)$$
+  This achieves sub-microsecond signing, requires zero disk I/O, and ensures identical key derivation across all backend nodes.
+
+### 5. Decoupled Asynchronous MongoDB Atlas Persistence
+Writing messages synchronously across the Internet to MongoDB Atlas introduces 30–80 ms of blocking network round-trip time.
+- **In-Memory Feed Cache**: An in-memory cache of 100,000 items (`_global_msg_cache`) serves `GET /feed` requests in $<1$ ms without making database queries.
+- **Decoupled Bulk Writes**: Incoming message documents are pushed non-blockingly to an in-memory queue (`queue.Queue(maxsize=100000)`). A dedicated OS daemon thread drains the queue in micro-batches of up to 500 documents and invokes MongoDB's bulk `insert_many(batch, ordered=False)`, keeping client response times under 1 ms.
+
+---
+
+## Environment Variables Reference
+
+### Backend Nodes (`server/config.py` & `server/store.py`)
+
+| Variable | Default | Explanation |
+| :--- | :--- | :--- |
+| `PORT` | `5000` | HTTP and WebSocket port for this backend node |
+| `SERVER_ID` | `backend-unknown` | Unique node identifier (e.g., `backend1`) used in logs and metrics |
+| `PEERS` | `""` | Comma-separated peer backend URLs for gossip synchronization |
+| `MONGODB_URL` | Cloud Atlas URL | MongoDB Atlas connection URI with credentials and cluster address |
+| `MONGODB_DB` | `group_chat` | Target database name in MongoDB |
+| `DEFAULT_ROOMS` | `general,random,tech` | Comma-separated list of default chat rooms |
+| `ADMIN_USERNAMES` | `admin` | Usernames granted moderator privileges (kick/mute) |
+| `HISTORY_LIMIT` | `50` | Number of recent messages replayed on joining a room |
+| `UVICORN_WORKERS`| `1` | Number of Uvicorn worker event loops per instance |
+
+### Go Load Balancer (`load-balancer/main.go`)
+
+| Variable | Default | Explanation |
+| :--- | :--- | :--- |
+| `LB_PORT` | `5000` | Port on which the Load Balancer listens for public client traffic |
+| `BACKENDS` | `172.17.0.99..` | Comma-separated upstream backend endpoints |
+| `LB_MAX_INFLIGHT`| `450` | Concurrency admission gate (set to `2500` for high concurrency) |
+| `LB_THRESHOLD` | `0.70` | Node score threshold for healthy routing |
+| `LB_W_CONN` | `0.40` | Scoring weight for active in-flight TCP connections |
+| `LB_W_LAT` | `0.35` | Scoring weight for EWMA response latency |
+| `LB_W_CPU` | `0.25` | Scoring weight for backend CPU telemetry |
+
+---
+
+## Commands to Start the System
+
+
+### Step 1: Prerequisites & Virtual Environment
 
 ```bash
-git clone https://github.com/ashutosh229/group-chat-application.git
-cd group-chat-application
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+# Clone repository and navigate to root directory
+git clone https://github.com/AjayChikate/group-chat.git
+cd group-chat
+
+# Create and activate Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate    # On Windows: .venv\Scripts\activate
+
+# Install backend dependencies
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Running the Server
+---
+
+### Step 2: Database Initialization
+
+Clear the MongoDB Atlas collection to start with a fresh state:
 
 ```bash
-python app.py
-```
+#  Export MongoDB connection parameters
+export MONGODB_URL="" # MongoDB Atlas connection string
+export MONGODB_DB="group_chat" # Target database name
 
-```
-Group Chat server running (FastAPI):
-  Local:   http://localhost:5000
-  Network: http://<this-machine-IP>:5000  (use for other lab machines)
-  Admins:  admin (set ADMIN_USERNAMES env var to change)
-```
-
-Open `http://localhost:5000` in a browser. To connect from another device on the same network, use the "Network" URL shown above and enter it as the **Server address** on the connect screen.
-
-Join with the username `admin` (or any name listed in `ADMIN_USERNAMES`) to get moderator controls in the user list.
-
-### Running with Docker
-
-No `Dockerfile` ships with this repo yet, but the app is stateless aside from the `data/` directory, so containerizing it is straightforward:
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-EXPOSE 5000
-CMD ["python", "app.py"]
-```
-
-```bash
-docker build -t group-chat .
-docker run -p 5000:5000 -v $(pwd)/data:/app/data group-chat
-```
-
-> Mount `data/` as a volume so the database and key material survive container restarts.
-
-## Configuration
-
-All configuration is environment-variable driven (see `server/config.py`) — no config file is required.
-
-| Variable                | Default               | Description                                                          |
-| ----------------------- | --------------------- | -------------------------------------------------------------------- |
-| `PORT`                  | `5000`                | HTTP/WebSocket listen port                                           |
-| `DEFAULT_ROOMS`         | `general,random,tech` | Comma-separated rooms that always exist, even empty                  |
-| `ADMIN_USERNAMES`       | `admin`               | Comma-separated, case-insensitive usernames granted moderator powers |
-| `HISTORY_LIMIT`         | `20`                  | Number of past messages replayed when a client joins/switches rooms  |
-| `HEARTBEAT_INTERVAL_MS` | `30000`               | WebSocket ping interval/timeout (ms)                                 |
-| `IDLE_TIMEOUT_MS`       | `100000`              | Idle time (ms) before a user is marked "away"                        |
-| `RATE_LIMIT_BURST`      | `8`                   | Token bucket capacity per connection                                 |
-| `RATE_LIMIT_REFILL`     | `2`                   | Tokens refilled per second per connection                            |
-
-Fixed limits (in `server/config.py`, not environment-configurable): `MAX_USERNAME_LEN=20`, `MAX_MESSAGE_LEN=1000`, `MAX_ROOM_NAME_LEN=24`.
-
-Example:
-
-```bash
-PORT=8080 ADMIN_USERNAMES=admin,shashank HISTORY_LIMIT=50 python app.py
-```
-
-## Security Model
-
-### Encryption & Signing Pipeline
-
-Every outgoing message is processed by `server/store.py::append_message` before it's ever written to disk:
-
-1. **Encrypt** — plaintext is sealed with **AES-256-GCM** using a server-wide master key generated on first run and stored at `data/master.key`, with a fresh random 96-bit nonce per message.
-2. **Sign** — a canonical payload (`msg_id | room_id | sender | timestamp | nonce | ciphertext`) is signed with the sender's **Ed25519** private key. Each username gets its own keypair, lazily generated on first message and stored under `data/keys/<username>.key`.
-3. **Persist** — ciphertext, nonce, and signature are stored as hex strings in the `messages` table in `data/chat.db`.
-
-On every history read (`get_history`), the pipeline runs in reverse and **fails closed**:
-
-- The signature is verified against the sender's stored Ed25519 public key.
-- The ciphertext is decrypted; AES-GCM's built-in authentication tag detects any modification.
-- If decryption fails: the message text is replaced with `[TAMPERED: AES-GCM Integrity Check Failed - Ciphertext Modified]`.
-- If the signature is invalid but decryption succeeds: the text is prefixed with `[UNVERIFIED SIGNATURE]`.
-- Either failure sets `"verified": false` / `"tampered": true` on the message object sent to the client.
-
-### Tamper Detection
-
-Run `python tamper_last.py` to flip one bit in the ciphertext of the most recently stored message. Reload the affected room and the corrupted message will render as tampered — this is a deliberate demo of the AEAD authentication tag doing its job, not a bug.
-
-### Key Management
-
-- `data/master.key` is the single symmetric key protecting **all** message content. Anyone with this file can decrypt every stored message.
-- `data/keys/<username>.key` holds each user's Ed25519 **private** key in raw form.
-- **These files must be treated as secrets.** They are created automatically on first run and are not encrypted at rest themselves.
-- Recommended for production: exclude `data/` from version control, restrict filesystem permissions (`chmod 600`), and back up `master.key` separately from `chat.db` (losing it makes all history permanently undecryptable).
-
-### Known Limitations
-
-- Authentication is username-only — there is no password, token, or identity verification, so usernames are trust-on-first-use. Anyone can claim any unused username, and admin status is granted purely by matching `ADMIN_USERNAMES`.
-- All messages share a single symmetric master key rather than per-room or per-conversation keys — this protects data at rest against tampering/inspection but is not true end-to-end encryption between users (the server can always decrypt).
-- No TLS/WSS termination is built in — put this behind a reverse proxy (nginx, Caddy, Traefik) with TLS in any environment reachable outside a trusted network.
-- No CSRF or origin checking is performed on the WebSocket handshake — recommended to add if deploying beyond a local/lab network.
-
-## WebSocket API Reference
-
-All application traffic (after the initial page load) flows over a single `/ws` WebSocket connection as JSON text frames.
-
-### Client → Server Events
-
-| Type              | Payload              | Notes                                                                               |
-| ----------------- | -------------------- | ----------------------------------------------------------------------------------- |
-| `join`            | `{ username, room }` | First message on every connection; server assigns a de-duplicated username if taken |
-| `message`         | `{ text }`           | Sent to the client's current room                                                   |
-| `private_message` | `{ to, text }`       | Direct message to another online user                                               |
-| `switch_room`     | `{ room }`           | Must be an existing room                                                            |
-| `create_room`     | `{ room }`           | `1–24` chars, `[a-zA-Z0-9_-]` only; also switches the client into it                |
-| `typing`          | `{}`                 | Broadcast to the client's current room                                              |
-| `kick`            | `{ target }`         | **Admin only**                                                                      |
-| `mute` / `unmute` | `{ target }`         | **Admin only**                                                                      |
-
-### Server → Client Events
-
-| Type              | Payload                                                                                                                |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `welcome`         | `{ username, room, isAdmin, users, rooms, onlineUsers, history }`                                                      |
-| `notification`    | `{ text, users, room }`                                                                                                |
-| `message`         | `{ id, username, text, room, timestamp }`                                                                              |
-| `private_message` | `{ id, from, to, text, timestamp }`                                                                                    |
-| `room_switched`   | `{ room, users, history }`                                                                                             |
-| `room_list`       | `{ rooms }`                                                                                                            |
-| `presence`        | `{ username, status }` — `online` \| `away` \| `offline`                                                               |
-| `typing`          | `{ username, room }`                                                                                                   |
-| `delivered`       | `{ id }`                                                                                                               |
-| `error`           | `{ text, code }` — codes include `muted`, `rate_limited`, `no_such_room`, `bad_room_name`, `user_offline`, `not_admin` |
-| `kicked`          | `{ by }`                                                                                                               |
-| `system_shutdown` | `{ text }`                                                                                                             |
-
-## HTTP Routes
-
-| Method | Path               | Description                                                                                                                                                              |
-| ------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET`  | `/`                | Serves `public/index.html`                                                                                                                                               |
-| `GET`  | `/{filename:path}` | Serves any file under `public/`; falls back to `index.html` for unknown paths (SPA-style routing); path traversal is blocked by resolving and validating the target path |
-| `WS`   | `/ws`              | The chat WebSocket endpoint                                                                                                                                              |
-
-## Utility Scripts
-
-**`clear_db.py`** — deletes all rows from `messages` and `user_keys`, then runs `VACUUM` to reclaim disk space. Destructive and irreversible.
-
-```bash
+# Run the cleanup utility
 python clear_db.py
 ```
 
-**`tamper_last.py`** — flips the low bit of the first ciphertext byte of the most recently stored message, simulating data-at-rest tampering. Use it to demonstrate the tamper-detection path described [above](#tamper-detection).
+---
 
+### Step 3: Launching the 3 Backend Nodes
+
+Open three separate terminal windows (or background jobs) to start each backend node with its respective peer mesh configuration:
+
+#### Node 1 (Port 5001)
 ```bash
-python tamper_last.py
+export PORT=5001  # Port for Backend 1
+export SERVER_ID="backend1"   # Identifier for Backend 1
+export PEERS="http://127.0.0.1:5002,http://127.0.0.1:5003"  # Peer URLs for gossip synchronization
+export MONGODB_URL="" # MongoDB Atlas URI
+export MONGODB_DB="group_chat"  # MongoDB database name
+export UVICORN_WORKERS=1 # 1 event loop worker to bound memory
+
+python app.py
 ```
 
-## Rate Limiting
-
-Each connection gets its own `TokenBucket` (`server/rate_limiter.py`), implemented as a sliding-window counter (current + weighted-previous window) rather than a naive fixed window, to avoid burst-at-boundary abuse. Defaults: burst capacity `8`, refill rate `2`/second — tune via `RATE_LIMIT_BURST` / `RATE_LIMIT_REFILL`. Exceeding the limit returns a `rate_limited` error event instead of dropping the connection.
-
-## Logging & Observability
-
-`server/logger.py` emits one JSON object per line to stdout for every significant event (`server_start`, `join`, `disconnect`, `room_created`, `moderation_kick`, `moderation_mute`, `moderation_unmute`, `socket_error`, etc.), each timestamped in UTC ISO-8601. This format is designed to be piped directly into `jq`, a log shipper, or an aggregator:
-
+#### Node 2 (Port 5002)
 ```bash
-python app.py | jq 'select(.event == "join")'
+export PORT=5002 # Port for Backend 2
+export SERVER_ID="backend2" #Identifier for Backend 2
+export PEERS="http://127.0.0.1:5001,http://127.0.0.1:5003" # Peer URLs for gossip synchronization
+export MONGODB_URL= "" # MongoDB Atlas URI
+export MONGODB_DB="group_chat"  #MongoDB database name
+export UVICORN_WORKERS=1 #1 event loop worker to bound memory
+
+python app.py
 ```
 
-uvicorn's own access logs are suppressed (`log_level='warning'`) so this structured log is the single source of truth for server activity.
+#### Node 3 (Port 5003)
+```bash
+export PORT=5003  # Port for Backend 3
+export SERVER_ID="backend3"  # Identifier for Backend 3
+export PEERS="http://127.0.0.1:5001,http://127.0.0.1:5002"  # Peer URLs for gossip synchronization
+export MONGODB_URL="" # MongoDB Atlas URI
+export MONGODB_DB="group_chat"  #MongoDB database name
+export UVICORN_WORKERS=1 # 1 event loop worker to bound memory
 
-## Deployment Notes
+python app.py
+```
 
-- Run behind a reverse proxy that terminates TLS and forwards WebSocket upgrades (e.g., nginx `proxy_pass` with `Upgrade`/`Connection` headers, or Caddy's automatic HTTPS).
-- Use `wss://` in the frontend's server-address field once TLS is in place.
-- Persist the `data/` directory on a durable volume; back up `master.key` and `chat.db` together, and store a separate copy of `master.key` — it cannot be regenerated without losing access to all existing history.
-- Presence sweeping and shutdown broadcasting run on a background daemon thread and are coordinated with the asyncio event loop via `run_coroutine_threadsafe`; this is safe for a single-process deployment but the app does not currently support horizontal scaling across multiple processes/nodes (room and presence state is in-memory, per-process).
+---
 
-## Troubleshooting
+### Step 4: Compiling & Launching the Go Load Balancer
 
-| Symptom                                | Likely cause                                                                                                                                       |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Could not connect" on the join screen | Wrong server address, server not running, or a firewall blocking the port                                                                          |
-| Messages show `[TAMPERED: ...]`        | Ciphertext was modified after being written (see [Tamper Detection](#tamper-detection)) — expected if you ran `tamper_last.py`                     |
-| Messages show `[UNVERIFIED SIGNATURE]` | The stored signature no longer matches the sender's public key — check whether `data/keys/<user>.key` was regenerated or `data/master.key` changed |
-| Reconnect loop never stops             | Client-side backoff caps at 16s and keeps retrying by design until the server is reachable again                                                   |
-| Admin controls not showing             | Username doesn't (case-insensitively) match `ADMIN_USERNAMES`                                                                                      |
+In a fourth terminal, build and run the Go load balancer configured with upstream backend URLs and high-concurrency admission parameters:
 
-## Future Roadmap and Plans
+```bash
+cd load-balancer
 
-- [ ] Password/token-based authentication
-- [ ] Per-room or per-conversation encryption keys
-- [ ] Built-in TLS/WSS support
-- [ ] Horizontal scaling (shared room/presence state via Redis or similar)
-- [ ] Automated test suite (unit + WebSocket integration tests)
-- [ ] Dockerfile and CI pipeline
+#  Build the standalone optimized binary
+go build -o lb main.go
 
-## Contributing
+# Export Load Balancer environment variables
+export LB_PORT="5297"  # Public port the load balancer listens on
+export BACKENDS="http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003"  # Target upstream backend instances
+export LB_MAX_INFLIGHT="2500"  # Admission gate concurrency limit (prevents queue buildup)
+export LB_THRESHOLD="0.70"    # Dynamic scoring tolerance threshold
+export LB_W_CONN="0.40"  # Connection weight in scoring equation
+export LB_W_LAT="0.35"  # EWMA latency weight in scoring equation
+export LB_W_CPU="0.25"     # CPU telemetry weight in scoring equation
+export GOMEMLIMIT="45MiB"  #Go runtime memory ceiling to prevent OOM
+export GOGC="20"     # Aggressive garbage collection trigger
 
-Contributions are welcome:
+# Execute the Load Balancer
+./lb
+```
 
-1. Fork the repository and create a feature branch.
-2. Keep the module boundaries intact — `ws_server.py` owns the wire protocol, `store.py`/`crypto.py` own persistence and cryptography, `rooms.py` stays in-memory-only.
-3. Run the app locally and manually verify chat, DMs, room switching, and moderation still work before submitting a PR.
-4. Open a pull request describing the change and its motivation.
+---
+
+### Step 5: Verifying Health & System Telemetry
+
+Test that the entire cluster is operational through the load balancer:
+
+```bash
+# 1. Health check across backends
+curl -i http://localhost:5297/health
+
+# 2. Cluster resource telemetry and metrics
+curl -s http://localhost:5297/metrics | jq .
+
+# 3. Post a test message through the Load Balancer
+curl -X POST http://localhost:5297/message \
+  -H "Content-Type: application/json" \
+  -d '{"client-name": "Alice", "msg": "Hello Distributed World!", "room": "general"}'
+
+# 4. Fetch the global message feed
+curl -s "http://localhost:5297/feed?room=general" | jq .
+```
+
+---
+
+## Project Directory Structure
+
+```
+.
+├── app.py                      # FastAPI application: routes, WS handler, lifecycle hooks
+├── clear_db.py                 # Utility script to wipe MongoDB collections
+├── requirements.txt            # Python dependencies (fastapi, uvicorn, pymongo, cryptography)
+│
+├── load-balancer/              # System 1: Go Edge Load Balancer
+│   ├── main.go                 # Dynamic EWMA scoring, clamped sockets, zero-alloc proxy
+│   └── go.mod                  # Go module definitions
+│
+├── server/                     # Systems 2-4: Core backend modules
+│   ├── config.py               # Centralized configuration & environment loader
+│   ├── crypto.py               # AES-256-GCM encryption & HMAC-SHA256 Ed25519 signing
+│   ├── gossip.py               # Redis-style in-memory Pub/Sub peer gossip mesh
+│   ├── logger.py               # Structured JSON logger
+│   ├── rate_limiter.py         # Token bucket rate limiting definitions
+│   ├── rooms.py                # In-memory room channel pub-sub subscriptions
+│   ├── store.py                # Feed RAM cache, async write queue, MongoDB client
+│   └── ws_server.py            # WebSocket protocol connection manager
+│
+├── public/                     # Static web frontend (HTML/CSS/JS)
+│   ├── index.html              # Chat UI layout
+│   ├── app.js                  # Client WebSocket connection & room logic
+│   └── style.css               # Styling definitions
+│
+└── plots/                     # plots 
+```
+
+---
 
 ## License
 
